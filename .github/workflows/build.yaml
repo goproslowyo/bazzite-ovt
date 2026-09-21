@@ -1,0 +1,110 @@
+name: build
+
+# Rebuild weekly so the image tracks Bazzite's base, and on any change to the
+# patches. The version guard in the Containerfile turns a Fedora open-vm-tools
+# rebase into a failed build here rather than a broken image on the VM.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+# A 5 GB image build per push adds up; supersede an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/bazzite-ovt
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The base image plus a full open-vm-tools build does not fit in the
+      # default runner disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Build
+        run: podman build -t "$IMAGE:latest" .
+
+      # One login for every tool in this job. docker/login-action writes
+      # ~/.docker/config.json, which podman falls back to when it finds no
+      # auth file of its own, and which cosign reads directly. Logging in with
+      # `podman login` instead would leave cosign unauthenticated, since the
+      # two keep separate credential stores.
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        run: |
+          TAG="$(date +%Y%m%d)"
+          podman tag "$IMAGE:latest" "$IMAGE:$TAG"
+          # --digestfile reports the digest of the manifest as it landed in the
+          # registry. The local digest from `podman image inspect` is not
+          # necessarily the same -- push can change the manifest -- and signing
+          # the local one produces a signature bootc will never find, while
+          # `cosign verify` still passes against that same local digest.
+          podman push --digestfile=/tmp/digest "$IMAGE:latest"
+          podman push "$IMAGE:$TAG"
+          DIGEST="$(cat /tmp/digest)"
+          echo "pushed digest: $DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          # Cross-check against what the registry actually serves for the tag.
+          skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:latest" \
+            | tee /tmp/remote-digest
+          test "$DIGEST" = "$(cat /tmp/remote-digest)" || {
+            echo "pushed digest does not match the tag in the registry" >&2
+            exit 1
+          }
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # The bootc/containers-image policy path discovers signatures through
+      # use-sigstore-attachments, which expects the legacy referrers layout.
+      # cosign v2 writes that layout by default. cosign v3 defaults to a new
+      # bundle format that `cosign verify` accepts but that policy path cannot
+      # find, surfacing later as "a signature was required, but no signature
+      # exists" on bootc upgrade -- so on v3 the old format must be requested
+      # explicitly. The flags do not exist on v2, hence the probe.
+      - name: Sign
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ""
+        run: |
+          test -n "$COSIGN_PRIVATE_KEY" || {
+            echo "SIGNING_SECRET is empty. It must be a *repository* secret;" >&2
+            echo "an environment secret is not visible to this job." >&2
+            exit 1
+          }
+          cosign version
+          LEGACY=""
+          if cosign sign --help 2>&1 | grep -q -- '--new-bundle-format'; then
+            LEGACY="--new-bundle-format=false --registry-referrers-mode=legacy"
+            echo "cosign v3+ detected, forcing the legacy attachment layout"
+          fi
+          cosign sign --yes $LEGACY \
+            --key env://COSIGN_PRIVATE_KEY \
+            "$IMAGE@${{ steps.push.outputs.digest }}"
+
+      # Fails the build if the signature is not where the bootc policy will
+      # look for it, rather than letting that surface as a confusing
+      # "signature was required" error on the next `bootc upgrade`.
+      - name: Verify
+        run: cosign verify --key cosign.pub "$IMAGE@${{ steps.push.outputs.digest }}"

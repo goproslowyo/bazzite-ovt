@@ -1,0 +1,343 @@
+Subject: [PATCH] dndcp/wayland: PNG image clipboard support
+Extends the clipway Wayland copy/paste backend (patch 0001) to carry
+CPFORMAT_IMG_PNG in both directions, mirroring copyPasteUIX11.cpp.
+ - CopyPasteWaylandSetText is generalised to CopyPasteWaylandSetData(mime,...);
+   the old entry point becomes a thin wrapper, leaving the text path unchanged.
+ - CopyPasteWaylandGetData reads a selection binary-safely via
+   g_spawn_async_with_pipes and a read loop into a GByteArray.
+   CopyPasteWaylandGetText recovers its length with strlen and therefore
+   cannot carry data containing NUL bytes, which every PNG does.
+ - CopyPasteWaylandHasType probes "wl-paste --list-types" so an image-less
+   selection costs one cheap spawn rather than a full read.
+ - GetLocalClipboard (guest -> host) probes image/png before text, matching the
+   precedence in copyPasteUIX11.cpp: an image selection commonly also offers a
+   text rendering, and taking it would silently downgrade the copy.
+ - GetRemoteClipboardCB (host -> guest) likewise prefers PNG over text, logs
+   which formats the host offered, and reports wl-copy failures.
+ - CopyPasteDnDWayland::GetCaps advertises DND_CP_CAP_IMAGE_CP. Without it the
+   VMX resolved copy/paste capabilities to 0x15 (VALID|CP|PLAIN_TEXT_CP) and
+   the image path was unreachable regardless of the code above. The X11
+   backend's FORMATS_ALL is deliberately not copied: RTF, file and DnD bits
+   would promise formats this backend does not implement.
+Gated on DND_CP_CAP_IMAGE_CP and bounded by CPCLIPITEM_MAX_SIZE_V3 (~4MB).
+Verified on Bazzite 44 (Fedora 44, KDE Plasma 6 Wayland) against
+open-vm-tools 13.1.0, VMware Workstation 26H2 on a Windows host.
+Guest -> host PNG confirmed working at ~2MB. Host -> guest remains
+non-functional: with caps resolved to 0x115 the host push still carries
+text only, which is outside the guest's control.
+---
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+--- a/services/plugins/dndcp/copyPasteDnDWayland.cpp	2026-09-21 06:49:25.326890242 +0000
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp	2026-09-21 06:49:26.038970705 +0000
+@@ -282,7 +282,9 @@
+  *
+  * CopyPasteDnDWayland::GetCaps --
+  *
+- *    Return platform DnD/CP capabilities: copy/paste of plain text only.
++ *    Return platform DnD/CP capabilities: copy/paste of plain text and
++ *    PNG images. Claim only what the backend implements -- advertising RTF,
++ *    file or DnD bits would promise formats with no code behind them.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -293,6 +295,7 @@
+    return DND_CP_CAP_VALID |
+           DND_CP_CAP_CP |
+           DND_CP_CAP_PLAIN_TEXT_CP |
++          DND_CP_CAP_IMAGE_CP |
+           DND_CP_CAP_ACTIVE_CP |
+           DND_CP_CAP_BIG_BUFFER;
+ }
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+--- a/services/plugins/dndcp/copyPasteUIWayland.cpp	2026-09-21 06:49:25.326900607 +0000
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp	2026-09-21 06:49:26.133727783 +0000
+@@ -66,12 +66,11 @@
+  */
+ 
+ static bool
+-CopyPasteWaylandSetText(const char *data,  // IN
+-                        gsize len)         // IN
++CopyPasteWaylandSetData(const gchar *mimeType,  // IN
++                        const char *data,       // IN
++                        gsize len)              // IN
+ {
+-   const gchar *argv[] = {
+-      "wl-copy", "--type", "text/plain;charset=utf-8", NULL
+-   };
++   const gchar *argv[] = { "wl-copy", "--type", mimeType, NULL };
+    GPid pid = 0;
+    gint stdinFd = -1;
+    GError *err = NULL;
+@@ -177,6 +176,161 @@
+ /*
+  *-----------------------------------------------------------------------------
+  *
++ * CopyPasteWaylandSetText --
++ *
++ *    Install plain UTF-8 text as the local selection.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandSetText(const char *data,  // IN
++                        gsize len)         // IN
++{
++   return CopyPasteWaylandSetData("text/plain;charset=utf-8", data, len);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandHasType --
++ *
++ *    Return true when the local selection advertises mimeType. Used to probe
++ *    for image/png before paying for a full read.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandHasType(const gchar *mimeType)  // IN
++{
++   const gchar *argv[] = { "wl-paste", "--list-types", NULL };
++   gchar *out = NULL;
++   gint status = 0;
++   GError *err = NULL;
++   bool found = false;
++
++   if (!g_spawn_sync(NULL, (gchar **) argv, NULL,
++                     (GSpawnFlags) G_SPAWN_SEARCH_PATH,
++                     NULL, NULL, &out, NULL, &status, &err)) {
++      g_debug("%s: failed to spawn wl-paste: %s\n", __FUNCTION__,
++              err != NULL ? err->message : "unknown error");
++      g_clear_error(&err);
++      g_free(out);
++      return false;
++   }
++
++   if (status == 0 && out != NULL) {
++      gchar **lines = g_strsplit(out, "\n", -1);
++      guint i;
++
++      for (i = 0; lines[i] != NULL; i++) {
++         if (g_ascii_strcasecmp(g_strstrip(lines[i]), mimeType) == 0) {
++            found = true;
++            break;
++         }
++      }
++      g_strfreev(lines);
++   }
++
++   g_free(out);
++   return found;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandGetData --
++ *
++ *    Binary-safe read of the local selection as mimeType. Unlike
++ *    CopyPasteWaylandGetText, which recovers the length with strlen and so
++ *    cannot carry data containing NUL bytes, this drains wl-paste's stdout
++ *    into a GByteArray and reports the true length. Returns NULL and leaves
++ *    *outLen at 0 on empty, unreadable, or oversized selections; the caller
++ *    frees the result with g_free.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static guchar *
++CopyPasteWaylandGetData(const gchar *mimeType,  // IN
++                        gsize *outLen)          // OUT
++{
++   const gchar *argv[] = {
++      "wl-paste", "--no-newline", "--type", (gchar *) mimeType, NULL
++   };
++   GPid pid = 0;
++   gint stdoutFd = -1;
++   GError *err = NULL;
++   GByteArray *acc;
++   guchar chunk[65536];
++   gint status = 0;
++   pid_t waited;
++   bool failed = false;
++
++   *outLen = 0;
++
++   if (!g_spawn_async_with_pipes(NULL, (gchar **) argv, NULL,
++            (GSpawnFlags) (G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD),
++            NULL, NULL, &pid, NULL, &stdoutFd, NULL, &err)) {
++      g_debug("%s: failed to spawn wl-paste: %s\n", __FUNCTION__,
++              err != NULL ? err->message : "unknown error");
++      g_clear_error(&err);
++      return NULL;
++   }
++
++   acc = g_byte_array_new();
++
++   for (;;) {
++      ssize_t got = read(stdoutFd, chunk, sizeof chunk);
++
++      if (got < 0) {
++         if (errno == EINTR) {
++            continue;
++         }
++         g_warning("%s: read from wl-paste failed: %s\n", __FUNCTION__,
++                   g_strerror(errno));
++         failed = true;
++         break;
++      }
++      if (got == 0) {
++         break;
++      }
++      /*
++       * Stop at the V3 argument ceiling rather than buffering a selection the
++       * host will refuse anyway. Closing the pipe below makes wl-paste exit.
++       */
++      if ((gsize) acc->len + (gsize) got > (gsize) CPCLIPITEM_MAX_SIZE_V3) {
++         g_debug("%s: %s selection exceeds the V3 limit, dropping\n",
++                 __FUNCTION__, mimeType);
++         failed = true;
++         break;
++      }
++      g_byte_array_append(acc, chunk, (guint) got);
++   }
++
++   close(stdoutFd);
++
++   do {
++      waited = waitpid(pid, &status, 0);
++   } while (waited < 0 && errno == EINTR);
++   g_spawn_close_pid(pid);
++
++   if (failed || waited < 0 || status != 0 || acc->len == 0) {
++      g_byte_array_free(acc, TRUE);
++      return NULL;
++   }
++
++   *outLen = (gsize) acc->len;
++   return g_byte_array_free(acc, FALSE);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
+  * CopyPasteUIWayland::CopyPasteUIWayland --
+  *
+  *    Constructor.
+@@ -293,7 +447,33 @@
+       return;
+    }
+ 
+-   if (CPClipboard_GetItem(clip, CPFORMAT_TEXT, &buf, &sz) &&
++   /*
++    * Log every format the host actually offered. The host may attach a text
++    * rendering (a filename or URL) to an image copy, so the order in which we
++    * consume formats decides what survives.
++    */
++   g_debug("%s: host clip offers:%s%s%s%s\n", __FUNCTION__,
++           CPClipboard_ItemExists(clip, CPFORMAT_IMG_PNG)  ? " png"   : "",
++           CPClipboard_ItemExists(clip, CPFORMAT_TEXT)     ? " text"  : "",
++           CPClipboard_ItemExists(clip, CPFORMAT_RTF)      ? " rtf"   : "",
++           CPClipboard_ItemExists(clip, CPFORMAT_FILELIST) ? " files" : "");
++
++   /*
++    * Prefer the image: taking a text rendering that accompanies a bitmap
++    * would silently downgrade the paste.
++    */
++   if (CPClipboard_GetItem(clip, CPFORMAT_IMG_PNG, &buf, &sz) &&
++       buf != NULL && sz > 0) {
++      g_debug("%s: setting %" G_GSIZE_FORMAT " bytes of PNG on local clipboard\n",
++              __FUNCTION__, (gsize) sz);
++      if (CopyPasteWaylandSetData("image/png", (const char *) buf, (gsize) sz)) {
++         mLastClipboardImage.assign((const char *) buf, sz);
++         mLastClipboardText.clear();
++      } else {
++         g_warning("%s: wl-copy failed to install the PNG selection\n",
++                   __FUNCTION__);
++      }
++   } else if (CPClipboard_GetItem(clip, CPFORMAT_TEXT, &buf, &sz) &&
+        buf != NULL && sz > 0) {
+       /*
+        * CPFORMAT_TEXT is NUL-terminated UTF-8 and sz includes the terminator.
+@@ -309,9 +489,12 @@
+               __FUNCTION__, len);
+       if (CopyPasteWaylandSetText(text, len)) {
+          mLastClipboardText.assign(text, len);
++      } else {
++         g_warning("%s: wl-copy failed to install the text selection\n",
++                   __FUNCTION__);
+       }
+    } else {
+-      g_debug("%s: no text item in remote clipboard (text-only backend)\n",
++      g_debug("%s: no text or image item in remote clipboard\n",
+               __FUNCTION__);
+    }
+ }
+@@ -345,6 +528,42 @@
+ 
+    CPClipboard_Clear(&mClipboard);
+ 
++   /*
++    * Probe for an image first, mirroring the precedence in copyPasteUIX11.cpp.
++    * An image selection commonly also advertises a text/plain rendering (a
++    * filename or a URL), and reading the text would silently downgrade the
++    * copy.
++    */
++   if (mCP->CheckCapability(DND_CP_CAP_IMAGE_CP) &&
++       CopyPasteWaylandHasType("image/png")) {
++      gsize imgLen = 0;
++      guchar *img = CopyPasteWaylandGetData("image/png", &imgLen);
++
++      if (img != NULL) {
++         std::string currentImage((const char *) img, imgLen);
++
++         if (currentImage == mLastClipboardImage) {
++            g_debug("%s: local clipboard image is unchanged\n", __FUNCTION__);
++            g_free(img);
++            SendClipNotChanged();
++            return;
++         }
++         mLastClipboardImage = currentImage;
++         mLastClipboardText.clear();
++
++         if (CPClipboard_SetItem(&mClipboard, CPFORMAT_IMG_PNG, img, imgLen)) {
++            g_debug("%s: got %" G_GSIZE_FORMAT " bytes of PNG\n",
++                    __FUNCTION__, imgLen);
++            g_free(img);
++            mCP->DestUISendClip(&mClipboard);
++            return;
++         }
++         g_debug("%s: failed to set PNG item, falling back to text\n",
++                 __FUNCTION__);
++         g_free(img);
++      }
++   }
++
+    text = CopyPasteWaylandGetText(&len);
+ 
+    /*
+@@ -375,6 +594,7 @@
+                  __FUNCTION__, len);
+       } else if (CPClipboard_SetItem(&mClipboard, CPFORMAT_TEXT, text, len + 1)) {
+          validDataInClip = true;
++         mLastClipboardImage.clear();
+          g_debug("%s: got %" G_GSIZE_FORMAT " bytes of text\n", __FUNCTION__, len);
+       }
+    }
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.h b/services/plugins/dndcp/copyPasteUIWayland.h
+--- a/services/plugins/dndcp/copyPasteUIWayland.h	2026-09-21 06:49:25.326916837 +0000
++++ b/services/plugins/dndcp/copyPasteUIWayland.h	2026-09-21 06:49:25.452192006 +0000
+@@ -67,6 +67,7 @@
+    GuestCopyPasteMgr *mCP;
+    CPClipboard mClipboard;
+    std::string mLastClipboardText;
++   std::string mLastClipboardImage;
+    bool mInited;
+ };
+ 

@@ -1,0 +1,4 @@
+*.rpm
+*.src.rpm
+rpmbuild/
+cosign.key
