@@ -61,8 +61,16 @@ RUN set -eux; \
     cp /patches/*.patch SOURCES/; \
     n=101; \
     : > /tmp/patchlines; \
-    for f in $(ls -1 /patches/*.patch | sort); do \
-        printf 'Patch%d:         %s\n' "$n" "$(basename "$f")" >> /tmp/patchlines; \
+    for f in /patches/*.patch; do \
+        test -e "$f" || break; \
+        b="$(basename "$f")"; \
+        if ! printf '%s' "$b" | grep -qE '^[0-9]{4}-[A-Za-z0-9._-]+\.patch$'; then \
+            echo "ERROR: refusing patch filename: $b" >&2; \
+            echo "Patch filenames must match NNNN-<name>.patch with <name> in [A-Za-z0-9._-]." >&2; \
+            echo "RPM expands macros inside tag values, so anything else can run shell at spec-parse time." >&2; \
+            exit 1; \
+        fi; \
+        printf 'Patch%d:         %s\n' "$n" "$b" >> /tmp/patchlines; \
         n=$((n+1)); \
     done; \
     test -s /tmp/patchlines; \
@@ -88,14 +96,21 @@ RUN set -eux; \
     cp RPMS/x86_64/open-vm-tools-desktop-${OVT_VERSION}-*.clipway.*.rpm /rpms/; \
     ls -1 /rpms
 
-# Canary: the Wayland backend shells out to wl-clipboard, so these literals are
-# present only if autoreconf regenerated the build with the new sources.
+# Canary: one literal per patch, so a patch that silently stops applying fails
+# the build instead of shipping a stock binary. In order: the native Wayland
+# selection, the wl-clipboard fallback, and the detection window's adoption
+# wait, which is what makes guest to host drags reach us at all.
 RUN set -eux; \
     cd "$(mktemp -d)"; \
     rpm2cpio /rpms/open-vm-tools-desktop-*.rpm | cpio -idm --quiet; \
     so=./usr/lib64/open-vm-tools/plugins/vmusr/libdndcp.so; \
+    strings "$so" | grep -q 'ext-data-control-v1'; \
     strings "$so" | grep -q 'wl-copy'; \
-    strings "$so" | grep -q 'list-types'; \
+    strings "$so" | grep -q 'managed after'; \
+    strings "$so" | grep -q 'pressing on the detection window'; \
+    strings "$so" | grep -q 'releasing the faked button'; \
+    strings "$so" | grep -q 'unsafe fileItem'; \
+    strings "$so" | grep -q 'providing file list'; \
     echo "patched dndcp verified"
 
 # ---------------------------------------------------------------------------
