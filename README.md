@@ -142,7 +142,7 @@ apply to plain X11 GTK4 sessions as well. That combination is untested.
 
 ## Patches
 
-Five patches against `open-vm-tools 13.1.0-25218885`, applied in order by the
+Six patches against `open-vm-tools 13.1.0-25218885`, applied in order by the
 Containerfile. Each patch carries its reasoning in its commit message.
 
 | Patch | What it does |
@@ -152,6 +152,7 @@ Containerfile. Each patch carries its reasoning in its commit message.
 | `0003-dndcp-detwnd-geometry` | Stops the code assuming the compositor places the detection window where it asked. |
 | `0004-dndcp-robustness` | A NULL `XOpenDisplay()` no longer kills the daemon, and a faked button press is always released. |
 | `0005-dndcp-validate-host-input` | Bounds two pre-existing reads of host-controlled data in helpers shared with the X11 backend. |
+| `0006-dndcp-any-desktop-file-drop` | Offers file drops on desktops other than GNOME and KDE. |
 
 The clipboard backend is derived from
 [clipway](https://github.com/krisztianfekete/clipway) by Krisztián Fekete,
