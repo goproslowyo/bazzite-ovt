@@ -6,6 +6,11 @@ name: build
 on:
   push:
     branches: [main]
+    # Only the patches and the Containerfile change the image, and a
+    # rebuild is 5 GB.
+    paths-ignore:
+      - '**.md'
+      - LICENSE
   schedule:
     - cron: '0 7 * * 1'
   workflow_dispatch:
