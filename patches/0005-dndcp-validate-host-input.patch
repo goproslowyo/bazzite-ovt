@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 21:29:21 -0700
+Subject: [PATCH 5/6] dndcp: validate host supplied file lists and file names
+
+Both of these helpers take their input straight from the host RPC channel and
+trust it. They are pre-existing and shared with the X11 backend; the
+capability bits the previous patch turns on make the second reachable for
+file contents copy and paste.
+
+DnDFileList::FromCPClipboard() casts its buffer to a CPFileList and then uses
+relPathsLen and fulPathsLen, both uint32 read out of that same buffer, as
+lengths to assign from. Neither is checked against how many bytes actually
+arrived, and the header is read before the buffer is known to be big enough
+to hold one. The over-read is then returned by GetRelPathsStr() and
+GetFullPathsStr(), so it does not stay in the guest. Check the header length
+first and each field against what remains, with the second test ordered so
+the subtraction cannot underflow. AttributesFromCPClipboard() has the same
+shape and gets the same check.
+
+LocalPrepareFileContents() joins a host supplied cpName onto the staging
+directory and then creates, writes and chmods the result. Nothing rejects an
+absolute path or a .. component, which makes it a host to guest arbitrary
+file write as the desktop user. cpName is opaque<> in the XDR definition and
+so carries no terminator, yet it is used as a C string. Reject a name that is
+unterminated, absolute, or has a .. component before it is used at all.
+
+Malformed input returns rather than asserting: this runs on the daemon's main
+loop and aborting on a bad message would itself be a denial of service.
+---
+ services/plugins/dndcp/copyPasteDnDUtil.cpp   | 67 +++++++++++++++++++
+ .../plugins/dndcp/dndGuestBase/dndFileList.cc | 26 +++++++
+ 2 files changed, 93 insertions(+)
+
+diff --git a/services/plugins/dndcp/copyPasteDnDUtil.cpp b/services/plugins/dndcp/copyPasteDnDUtil.cpp
+index 20601b8..1266be6 100644
+--- a/services/plugins/dndcp/copyPasteDnDUtil.cpp
++++ b/services/plugins/dndcp/copyPasteDnDUtil.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include "copyPasteDnDUtil.h"
+ #include "file.h"
++#include "str.h"
+ #include "dndFileContentsUtil.h"
+ #include "dndFileList.hh"
+ #include "copyPasteUIX11.h"
+@@ -36,6 +37,61 @@ extern "C" {
+ }
+ 
+ 
++/*
++ *----------------------------------------------------------------------------
++ *
++ * LocalIsSafeStagingName --
++ *
++ *      Check that a host supplied file name is NUL terminated and can only
++ *      name something below the staging directory it will be appended to.
++ *
++ * Results:
++ *      true if the name is safe to use, false otherwise.
++ *
++ * Side effects:
++ *      None.
++ *
++ *----------------------------------------------------------------------------
++ */
++
++static bool
++LocalIsSafeStagingName(const char *name,     // IN: host supplied file name
++                       size_t len)           // IN: bytes at name
++{
++   const char *comp = name;
++
++   if (len == 0 || name[len - 1] != '\0') {
++      return false;
++   }
++
++   if (*name == '\0' || File_IsFullPath(name)) {
++      return false;
++   }
++
++   /*
++    * CR and LF each end an entry in a text/uri-list, and this name is put
++    * into one. A name carrying either would be published as several entries,
++    * the extra ones naming whatever the host chose.
++    */
++   if (Str_Strchr(name, '\r') != NULL || Str_Strchr(name, '\n') != NULL) {
++      return false;
++   }
++
++   while (comp != NULL) {
++      if (Str_Strncmp(comp, "..", 2) == 0 &&
++          (comp[2] == '\0' || comp[2] == DIRSEPC)) {
++         return false;
++      }
++      comp = Str_Strchr(comp, DIRSEPC);
++      if (comp != NULL) {
++         comp++;
++      }
++   }
++
++   return true;
++}
++
++
+ /*
+  *----------------------------------------------------------------------------
+  *
+@@ -139,6 +195,17 @@ LocalPrepareFileContents(const CPClipboard *clip,                       // IN
+                              fileItem[i].cpName.cpName_len - 1,
+                              '\0',
+                              DIRSEPC);
++
++      /*
++       * The name is host supplied and is about to be joined onto the staging
++       * directory, so it must not be able to name anything outside of it.
++       */
++      if (!LocalIsSafeStagingName(fileItem[i].cpName.cpName_val,
++                                  fileItem[i].cpName.cpName_len)) {
++         Warning("%s: unsafe fileItem[%" FMTSZ "u].cpName.\n", __FUNCTION__, i);
++         goto exit;
++      }
++
+       fileName = fileItem[i].cpName.cpName_val;
+       filePathName = tempDir;
+       filePathName += DIRSEPS + fileName;
+diff --git a/services/plugins/dndcp/dndGuestBase/dndFileList.cc b/services/plugins/dndcp/dndGuestBase/dndFileList.cc
+index 15b521f..50fe33d 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndFileList.cc
++++ b/services/plugins/dndcp/dndGuestBase/dndFileList.cc
+@@ -489,6 +489,7 @@ DnDFileList::FromCPClipboard(const void *buf,   // IN: Source buffer
+ {
+    const CPFileList *flist;
+    std::string relPaths;
++   size_t payloadLen;
+ 
+    ASSERT(buf);
+    ASSERT(len);
+@@ -496,7 +497,22 @@ DnDFileList::FromCPClipboard(const void *buf,   // IN: Source buffer
+       return false;
+    }
+ 
++   /*
++    * The header and its length fields come straight off the wire, so nothing
++    * may be dereferenced until they have been checked against len.
++    */
++   if (len < CPFILELIST_HEADER_SIZE) {
++      return false;
++   }
++
+    flist = reinterpret_cast<const CPFileList *>(buf);
++   payloadLen = len - CPFILELIST_HEADER_SIZE;
++
++   if (flist->relPathsLen > payloadLen ||
++       flist->fulPathsLen > payloadLen - flist->relPathsLen) {
++      return false;
++   }
++
+    relPaths.assign(
+       reinterpret_cast<const char *>(flist->filelists), flist->relPathsLen);
+ 
+@@ -542,8 +558,18 @@ DnDFileList::AttributesFromCPClipboard(const void *buf, // IN: Source buffer
+       return false;
+    }
+ 
++   if (len < URI_ATTRIBUTES_LIST_HEADER_SIZE) {
++      return false;
++   }
++
+    alist = reinterpret_cast<const CPAttributeList *>(buf);
+ 
++   /* attributesLen is host supplied; it must fit in what was actually sent. */
++   if (alist->attributesLen >
++       (len - URI_ATTRIBUTES_LIST_HEADER_SIZE) / sizeof (CPFileAttributes)) {
++      return false;
++   }
++
+    mAttributeList.resize(alist->attributesLen);
+    for (uint32 i = 0; i < alist->attributesLen; i++) {
+       mAttributeList[i] = alist->attributeList[i];
