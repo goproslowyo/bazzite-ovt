@@ -6,8 +6,7 @@ name: build
 on:
   push:
     branches: [main]
-    # Only the patches and the Containerfile change the image, and a
-    # rebuild is 5 GB.
+    # Documentation does not change the image, and a rebuild is 5 GB.
     paths-ignore:
       - '**.md'
       - LICENSE
@@ -40,7 +39,11 @@ jobs:
           df -h /
 
       - name: Build
-        run: podman build -t "$IMAGE:latest" .
+        # SIGNED_REPO must follow IMAGE. It names the repository the embedded
+        # signature policy enforces, and a fork that left it at the default
+        # would ship a policy pointing at someone else's images, so its own
+        # would go unenforced.
+        run: podman build --build-arg SIGNED_REPO="$IMAGE" -t "$IMAGE:latest" .
 
       # One login for every tool in this job. docker/login-action writes
       # ~/.docker/config.json, which podman falls back to when it finds no
@@ -56,17 +59,24 @@ jobs:
 
       - name: Push
         id: push
+        if: github.ref == 'refs/heads/main'
         run: |
           TAG="$(date +%Y%m%d)"
           podman tag "$IMAGE:latest" "$IMAGE:$TAG"
           # --digestfile reports the digest of the manifest as it landed in the
-          # registry. The local digest from `podman image inspect` is not
-          # necessarily the same -- push can change the manifest -- and signing
-          # the local one produces a signature bootc will never find, while
+          # registry. The local digest from `podman image inspect` can differ,
+          # because push can change the manifest. Signing the local one produces a signature bootc will never find, while
           # `cosign verify` still passes against that same local digest.
           podman push --digestfile=/tmp/digest "$IMAGE:latest"
           podman push "$IMAGE:$TAG"
           DIGEST="$(cat /tmp/digest)"
+          # This value is expanded into later shells; keep it to the shape a
+          # digest can actually have.
+          # [[ =~ ]] anchors to the whole string; grep would anchor per line.
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "refusing a digest that is not sha256:<64 hex>: $DIGEST" >&2
+            exit 1
+          }
           echo "pushed digest: $DIGEST"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           # Cross-check against what the registry actually serves for the tag.
@@ -87,9 +97,11 @@ jobs:
       # writes a format it cannot find and refuses the flags that ask for the
       # old one, so pin v2 and stop the build on anything else.
       - name: Sign
+        if: github.ref == 'refs/heads/main'
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
           COSIGN_PASSWORD: ""
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           test -n "$COSIGN_PRIVATE_KEY" || {
             echo "SIGNING_SECRET is empty. It must be a *repository* secret;" >&2
@@ -109,10 +121,13 @@ jobs:
           esac
           cosign sign --yes \
             --key env://COSIGN_PRIVATE_KEY \
-            "$IMAGE@${{ steps.push.outputs.digest }}"
+            "$IMAGE@$DIGEST"
 
       # Fails the build if the signature is not where the bootc policy will
       # look for it, rather than letting that surface as a confusing
       # "signature was required" error on the next `bootc upgrade`.
       - name: Verify
-        run: cosign verify --key cosign.pub "$IMAGE@${{ steps.push.outputs.digest }}"
+        if: github.ref == 'refs/heads/main'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign verify --key cosign.pub "$IMAGE@$DIGEST"

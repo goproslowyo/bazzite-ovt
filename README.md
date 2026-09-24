@@ -266,8 +266,9 @@ systemctl reboot
 
 To set this up in a fork: generate a keypair with
 `COSIGN_PASSWORD="" cosign generate-key-pair`, add `cosign.key` as the
-`SIGNING_SECRET` repository secret, commit `cosign.pub` at the repo root, and
-change `SIGNED_REPO` in the Containerfile. Never commit `cosign.key`.
+`SIGNING_SECRET` repository secret, and commit `cosign.pub` at the repo
+root. The workflow passes the fork's own image name as `SIGNED_REPO`. Never
+commit `cosign.key`.
 
 ## Maintenance
 
@@ -282,8 +283,12 @@ unpatched image. When it fires, re-verify the patches against the new tree and
 bump the arg. A new *Fedora* patch can also collide, which shows up the same
 way, as a `%prep` failure.
 
-The build also greps the finished library for one literal per patch, so a patch that
-silently stops applying fails the build rather than shipping a stock binary.
+The build also greps the finished library for one literal per patch. A patch
+that stops applying already fails `%prep`, so what this catches is the quieter
+path: Fedora dropping `autoreconf`, or turning GTK4 off, or the `Patch` lines
+landing somewhere `%autosetup` does not reach. It proves those literals were
+compiled in, not that the patched code still behaves, and it reads only
+`open-vm-tools-desktop`.
 
 Customise this image by editing the Containerfile, not with local
 `rpm-ostree install/remove` on the running system. Local modifications make
@@ -306,16 +311,22 @@ Logging is off by default. To turn it on, `/etc/vmware-tools/tools.conf`:
 log = true
 vmusr.level = debug
 vmusr.handler = file
-vmusr.data = /tmp/vmusr.log
+vmusr.data = /run/user/1000/vmusr.log
 ```
+
+The log records the paths of every file dragged or pasted, in both
+directions, so keep it in your own runtime directory rather than `/tmp`: the
+logger creates the file before it chmods it to 0600, and it ignores the chmod
+failing. Clipboard and file *contents* are never logged, only their sizes.
 
 Log out and back in, then (`-a` because upstream's RpcIn lines contain NULs):
 
 ```bash
-grep -a 'ping reply caps' /tmp/vmusr.log     # want 1555 and aab
-grep -a 'ext-data-control' /tmp/vmusr.log    # want: using ext-data-control-v1
-grep -a 'vmblock' /tmp/vmusr.log             # want: vmblock ready (fd 3)
-grep -a -iE 'host clip offers|formats locally|bytes of|paste observed' /tmp/vmusr.log
+log=/run/user/$(id -u)/vmusr.log
+grep -a 'ping reply caps' $log     # want 1555 and aab
+grep -a 'ext-data-control' $log    # want: using ext-data-control-v1
+grep -a 'vmblock' $log             # want: vmblock ready (fd 3)
+grep -a -iE 'host clip offers|formats locally|bytes of|paste observed' $log
 ```
 
 A working file paste logs `added block`, then the URI list on copy, then

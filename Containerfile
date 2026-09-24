@@ -22,6 +22,9 @@ ARG OVT_VERSION=13.1.0
 # ---------------------------------------------------------------------------
 FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE} AS builder
 ARG OVT_VERSION
+# Re-declared: an ARG before the first FROM is global scope only, and the
+# src.rpm signature check below needs the release to name Fedora's key.
+ARG FEDORA_RELEASE
 
 RUN dnf install -y fedora-packager rpmdevtools 'dnf-command(builddep)' \
     && dnf clean all
@@ -34,8 +37,34 @@ WORKDIR /root/rpmbuild
 COPY patches/ /patches/
 
 # Fetch the distro source package.
-RUN dnf download --source open-vm-tools --enablerepo='*-source' \
-    && rpm -i open-vm-tools-*.src.rpm
+#
+# Name the two source repos rather than globbing '*-source': the glob also
+# matches updates-testing-source, so the build could silently pick up an SRPM
+# that has not passed Bodhi gating.
+#
+# dnf download is not a transaction and performs no OpenPGP check, and rpm's
+# default _pkgverify_level is 'digest', so an unsigned or tampered src.rpm
+# would install without complaint. This is the one input that becomes the
+# shipped binary, so verify it against Fedora's key explicitly. Compare the
+# whole line: an unsigned package prints "<name>: digests OK" and exits 0, so
+# a substring match on the verdict can be satisfied by the file's name.
+RUN set -eux; \
+    dnf download --source open-vm-tools \
+        --enablerepo=fedora-source --enablerepo=updates-source; \
+    rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-${FEDORA_RELEASE}-primary; \
+    set -- open-vm-tools-*.src.rpm; \
+    test "$#" -eq 1 || { echo "ERROR: expected one src.rpm, got $#: $*" >&2; exit 1; }; \
+    r="$1"; \
+    case "$r" in \
+        *[!A-Za-z0-9._+~^-]*) echo "ERROR: unexpected src.rpm name: $r" >&2; exit 1 ;; \
+    esac; \
+    out="$(rpmkeys --checksig "$r")"; \
+    echo "$out"; \
+    [ "$out" = "$r: digests signatures OK" ] || { \
+        echo "ERROR: $r did not verify against a trusted key." >&2; \
+        exit 1; \
+    }; \
+    rpm -i "$r"
 
 # The patches are written against a specific upstream tree. If Fedora moves to
 # a different version, stop here instead of producing a subtly broken build.
@@ -57,6 +86,7 @@ RUN set -eux; \
 # number keeps this sorting above whatever Fedora ships, which is what
 # "rpm-ostree override replace" requires.
 RUN set -eux; \
+    export LC_ALL=C; \
     spec=SPECS/open-vm-tools.spec; \
     cp /patches/*.patch SOURCES/; \
     n=101; \
@@ -64,7 +94,11 @@ RUN set -eux; \
     for f in /patches/*.patch; do \
         test -e "$f" || break; \
         b="$(basename "$f")"; \
-        if ! printf '%s' "$b" | grep -qE '^[0-9]{4}-[A-Za-z0-9._-]+\.patch$'; then \
+        case "$b" in \
+            *[!A-Za-z0-9._-]*|'') bad=1 ;; \
+            *) bad=0 ;; \
+        esac; \
+        if [ "$bad" = 1 ] || ! printf '%s' "$b" | grep -qE '^[0-9]{4}-[A-Za-z0-9._-]+\.patch$'; then \
             echo "ERROR: refusing patch filename: $b" >&2; \
             echo "Patch filenames must match NNNN-<name>.patch with <name> in [A-Za-z0-9._-]." >&2; \
             echo "RPM expands macros inside tag values, so anything else can run shell at spec-parse time." >&2; \
@@ -110,7 +144,7 @@ RUN set -eux; \
     strings "$so" | grep -q 'pressing on the detection window'; \
     strings "$so" | grep -q 'releasing the faked button'; \
     strings "$so" | grep -q 'unsafe fileItem'; \
-    strings "$so" | grep -q 'providing file list'; \
+    strings "$so" | grep -q 'no XDG_CURRENT_DESKTOP'; \
     echo "patched dndcp verified"
 
 # ---------------------------------------------------------------------------
