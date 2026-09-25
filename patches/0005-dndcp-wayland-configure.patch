@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:09 -0700
+Subject: [PATCH 05/21] dndcp: Detect the Wayland libraries at configure time
+
+The following patches add a Wayland backend to the dndcp plugin. It
+talks to the compositor directly, so it needs libwayland-client, and it
+needs wayland-scanner and wayland-protocols to generate the protocol
+code when the plugin is built. ext-data-control-v1, the newest protocol
+it uses, first appeared in wayland-protocols 1.39.
+
+Add --with-wayland to configure, with auto as the default. When Gtk+
+support is on, configure checks for wayland-client, wayland-scanner and
+wayland-protocols >= 1.39 through pkg-config, and reads the path of the
+scanner and the data directory of the protocols from their .pc files. It
+then defines HAVE_WAYLAND and sets the HAVE_WAYLAND automake
+conditional, under which the plugin gets WAYLAND_CFLAGS and
+WAYLAND_LIBS. With auto, missing packages give a warning and a build
+without Wayland support. With --with-wayland they are an error, and so
+is --with-wayland without Gtk+.
+
+To build without Wayland support, configure with --without-wayland. The
+plugin then contains no Wayland code and does not link
+libwayland-client, and every session uses the X11 backend as it does
+today. Nothing uses HAVE_WAYLAND yet.
+---
+ configure.ac                       | 38 ++++++++++++++++++++++++++++++
+ services/plugins/dndcp/Makefile.am |  5 ++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/configure.ac b/configure.ac
+index bf180b7..3ad2be1 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -246,6 +246,14 @@ AC_ARG_WITH(
+    [with_gtk3="$withval"],
+    [with_gtk3="auto"])
+ 
++AC_ARG_WITH(
++   wayland,
++   AS_HELP_STRING(
++      [--without-wayland],
++      [compiles the dndcp plugin without native Wayland copy/paste and drag and drop]),
++   [with_wayland="$withval"],
++   [with_wayland="auto"])
++
+ 
+ # only one "with_gtkX" option allowed
+ num_gtk_args=0
+@@ -1129,6 +1137,35 @@ else
+    fi # End of checks for gtkmm3, gtkmm4
+ fi # End of checks for X libraries
+ 
++#
++# The dndcp plugin talks to the Wayland compositor directly for copy/paste
++# and drag and drop in a Wayland session. It needs libwayland-client, and
++# wayland-scanner and wayland-protocols to generate the protocol code.
++# ext-data-control-v1 first appeared in wayland-protocols 1.39.
++#
++have_wayland="no"
++if test "$with_wayland" != "no"; then
++   if test "$have_gtk" = "yes"; then
++      PKG_CHECK_MODULES(
++         [WAYLAND],
++         [wayland-client wayland-scanner wayland-protocols >= 1.39],
++         [PKG_CHECK_VAR([WAYLAND_SCANNER], [wayland-scanner], [wayland_scanner])
++          PKG_CHECK_VAR([WAYLAND_PROTOCOLS_DATADIR], [wayland-protocols], [pkgdatadir])
++          have_wayland="yes"],
++         [AS_IF([test "$with_wayland" = "auto"],
++                [AC_MSG_WARN([wayland-client, wayland-scanner or wayland-protocols >= 1.39 not found. The dndcp plugin will be built without native Wayland support.])],
++                [AC_MSG_ERROR([wayland-client, wayland-scanner or wayland-protocols >= 1.39 not found. Please install the wayland and wayland-protocols devel packages, or configure using --without-wayland.])])])
++   elif test "$with_wayland" = "yes"; then
++      AC_MSG_ERROR([Wayland support needs Gtk+ support. Please configure with Gtk+, or using --without-wayland.])
++   fi
++fi
++if test "$have_wayland" = "yes"; then
++   if test -z "$WAYLAND_SCANNER" || test -z "$WAYLAND_PROTOCOLS_DATADIR"; then
++      AC_MSG_ERROR([pkg-config did not report the wayland-scanner program or the wayland-protocols data directory.])
++   fi
++   AC_DEFINE([HAVE_WAYLAND], 1, [Define to 1 if building with native Wayland support.])
++fi
++
+ AC_CHECK_LIB(
+    [crypt],
+    [crypt],
+@@ -1696,6 +1733,7 @@ AM_CONDITIONAL(HAVE_FUSE3, test "$have_fuse3" = "yes")
+ AM_CONDITIONAL(HAVE_GNU_LD, test "$with_gnu_ld" = "yes")
+ AM_CONDITIONAL(HAVE_GTK4,  test "$have_x" = "yes" && test "$with_gtk4" = "yes")
+ AM_CONDITIONAL(HAVE_GTKMM,  test "$have_x" = "yes" && test "$have_gtkmm" = "yes")
++AM_CONDITIONAL(HAVE_WAYLAND, test "$have_wayland" = "yes")
+ AM_CONDITIONAL(HAVE_PAM, test "$with_pam" = "yes")
+ AM_CONDITIONAL(USE_SLASH_PROC, test "$os" = "linux")
+ AM_CONDITIONAL(ENABLE_CONTAINERINFO, test "$enable_containerinfo" = "yes")
+diff --git a/services/plugins/dndcp/Makefile.am b/services/plugins/dndcp/Makefile.am
+index e093874..076ac54 100644
+--- a/services/plugins/dndcp/Makefile.am
++++ b/services/plugins/dndcp/Makefile.am
+@@ -110,6 +110,11 @@ libdndcp_la_SOURCES += dndUIX11.cpp
+ libdndcp_la_SOURCES += dragDetWndX11.cpp
+ endif
+ 
++if HAVE_WAYLAND
++libdndcp_la_CPPFLAGS += @WAYLAND_CFLAGS@
++libdndcp_la_LIBADD += @WAYLAND_LIBS@
++endif
++
+ if LINUX
+ libdndcp_la_CPPFLAGS += -I$(top_srcdir)/services/plugins/dndcp/fakeMouse
+ libdndcp_la_SOURCES  += fakeMouseWayland/fakeMouseWayland.cpp
+-- 
+2.55.0
+

@@ -1,0 +1,927 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:09 -0700
+Subject: [PATCH 07/21] dndcp: Copy and paste from the host in a Wayland
+ session
+
+Copy and paste between host and guest does not work in a Wayland
+session. The plugin drives the X11 selection directly, and from an
+Xwayland client that does not reach native Wayland applications on every
+compositor. A compositor also gives the Wayland selection only to a
+client with keyboard focus, and vmusr has no window.
+
+Add a Wayland backend, CopyPasteDnDWayland, with the copy and paste UI
+in CopyPasteUIWayland. CopyPasteDnDWrapper chooses it at run time when
+WAYLAND_DISPLAY is set and the session is not an X11 one, or when there
+is no X display. A compositor started from a text console, such as sway,
+leaves XDG_SESSION_TYPE at "tty", and an X11 session that happens to
+export WAYLAND_DISPLAY says "x11". The backend is built for both the
+GTK3 and the GTK4 configuration, when configure has found the Wayland
+libraries.
+
+This patch installs host clips. The UI takes the selection through
+waylandClipboard/ where the compositor implements ext-data-control-v1,
+as KWin and wlroots do. It offers every format the host sent and answers
+each request with the bytes for the requested type. One selection then
+carries a PNG image, RTF and the plain text rendering at once, as the
+X11 backend does with separate selection targets. Without data control,
+copy and paste is off. The following patches read the guest selection
+and cover GNOME.
+
+Drag and drop stays with DnDUIX11, for which the backend pins GDK to its
+X11 backend, so the detection window is an Xwayland client. gtk_init()
+exits the process when it cannot open a display, and a Wayland session
+may have no Xwayland. The backend calls gtk_init_check() first and
+leaves drag and drop off without GTK. vmusr as shipped still needs the
+display, because the desktopEvents plugin, which loads first, calls
+gtk_init() itself. It does not advertise drag and
+drop, which a later patch makes work under Xwayland. It advertises copy
+and paste of plain text, RTF and PNG images.
+---
+ services/plugins/dndcp/Makefile.am            |   2 +
+ .../plugins/dndcp/copyPasteDnDWayland.cpp     | 410 ++++++++++++++++++
+ services/plugins/dndcp/copyPasteUIWayland.cpp | 239 ++++++++++
+ services/plugins/dndcp/copyPasteUIWayland.h   |  68 +++
+ .../dndcp/dndGuestBase/copyPasteDnDWayland.h  |  73 ++++
+ .../dndGuestBase/copyPasteDnDWrapper.cpp      |  25 ++
+ 6 files changed, 817 insertions(+)
+ create mode 100644 services/plugins/dndcp/copyPasteDnDWayland.cpp
+ create mode 100644 services/plugins/dndcp/copyPasteUIWayland.cpp
+ create mode 100644 services/plugins/dndcp/copyPasteUIWayland.h
+ create mode 100644 services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+
+diff --git a/services/plugins/dndcp/Makefile.am b/services/plugins/dndcp/Makefile.am
+index 5314f06..1708607 100644
+--- a/services/plugins/dndcp/Makefile.am
++++ b/services/plugins/dndcp/Makefile.am
+@@ -115,6 +115,8 @@ if HAVE_WAYLAND
+ libdndcp_la_CPPFLAGS += @WAYLAND_CFLAGS@
+ libdndcp_la_LIBADD += @WAYLAND_LIBS@
+ 
++libdndcp_la_SOURCES += copyPasteDnDWayland.cpp
++libdndcp_la_SOURCES += copyPasteUIWayland.cpp
+ libdndcp_la_SOURCES += waylandClipboard/waylandClipboard.c
+ endif
+ 
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+new file mode 100644
+index 0000000..dafc5a8
+--- /dev/null
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+@@ -0,0 +1,410 @@
++/*********************************************************
++ * Copyright (C) 2026 GoProSlowYo
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation version 2.1 and no later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
++ *
++ *********************************************************/
++
++/**
++ * @file copyPasteDnDWayland.cpp
++ *
++ * Copy and paste for a Wayland session, derived from copyPasteDnDX11.cpp.
++ * It creates no invisible X window, registers no legacy backdoor copy paste,
++ * and sets none of the Xlib globals that CopyPasteDnDX11::Init() sets.
++ * Drag and drop is delegated to DnDUIX11. Without an X display, copy and
++ * paste still works and drag and drop is left off.
++ */
++
++#define G_LOG_DOMAIN "dndcp"
++
++#include <string.h>
++
++#include "copyPasteDnDWrapper.h"
++#include "copyPasteDnDWayland.h"
++#include "copyPasteUIWayland.h"
++
++extern "C" {
++#include "dndCPMsgV4.h"
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::CopyPasteDnDWayland --
++ *
++ *    Constructor.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++CopyPasteDnDWayland::CopyPasteDnDWayland()
++ : m_ctx(NULL),
++   m_copyPasteUI(NULL),
++   m_dndUI(NULL),
++#if defined(GTK3)
++   m_main(NULL),
++#endif
++   m_haveGtk(false)
++{
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::~CopyPasteDnDWayland --
++ *
++ *    Destructor.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++CopyPasteDnDWayland::~CopyPasteDnDWayland()
++{
++   if (m_copyPasteUI) {
++      delete m_copyPasteUI;
++      m_copyPasteUI = NULL;
++   }
++   if (m_dndUI) {
++      delete m_dndUI;
++      m_dndUI = NULL;
++   }
++#if defined(GTK3)
++   delete m_main;
++#endif
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::Init --
++ *
++ *    Initialize the Wayland platform DnD/CP. Pin GDK to its X11 backend for
++ *    drag and drop. The copy/paste UI is created lazily in RegisterCP,
++ *    mirroring the X11 backend.
++ *
++ *    Gtk::Application and Gtk::Main call gtk_init(), which exits the process
++ *    when it cannot open a display, and a Wayland session may have no
++ *    Xwayland. So this calls gtk_init_check() first and creates them only
++ *    when it succeeds. Without GTK, drag and drop stays off.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
++{
++   m_ctx = ctx;
++
++   /*
++    * Drag and drop is delegated to DnDUIX11, which needs GTK on its X11
++    * backend. Under a Wayland session that makes the detection window an
++    * Xwayland client. DnDUIX11 then uses XDND, which the compositor bridges
++    * to native clients. The X11-specific code would crash on a Wayland
++    * GdkSurface. This mirrors CopyPasteDnDX11::Init.
++    */
++   gdk_set_allowed_backends("x11");
++#ifdef GTK4
++   m_haveGtk = gtk_init_check();
++   if (m_haveGtk) {
++      Gtk::Application::create("com.tools.gtk4");
++   }
++#else
++   int argc = 1;
++   const char *argv[] = {"", NULL};
++   char **argvp = (char **) argv;
++
++   m_haveGtk = gtk_init_check(&argc, &argvp);
++   if (m_haveGtk) {
++      m_main = new Gtk::Main(&argc, &argvp, false);
++   }
++#endif
++   if (!m_haveGtk) {
++      g_warning("%s: cannot open an X display, drag and drop is disabled\n",
++                __FUNCTION__);
++   }
++
++   return TRUE;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::PointerInit --
++ *
++ *    No-op on Wayland. Pointer_Init() works through the Xlib globals that
++ *    CopyPasteDnDX11::Init() sets, and this backend leaves them unset.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::PointerInit()
++{
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::RegisterCP --
++ *
++ *    Register copy and paste capabilities with the VMX. Mirrors
++ *    CopyPasteDnDX11::RegisterCP without the legacy backdoor registration.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++CopyPasteDnDWayland::RegisterCP()
++{
++   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
++
++   if (wrapper->IsCPRegistered()) {
++      return TRUE;
++   }
++
++   if (!wrapper->IsCPEnabled()) {
++      return FALSE;
++   }
++
++   m_copyPasteUI = new CopyPasteUIWayland();
++   if (m_copyPasteUI) {
++      if (m_copyPasteUI->Init()) {
++         wrapper->SetCPIsRegistered(TRUE);
++         int version = wrapper->GetCPVersion();
++         g_debug("%s: version is %d\n", __FUNCTION__, version);
++         if (version >= 3) {
++            CopyPasteVersionChanged(version);
++            m_copyPasteUI->SetCopyPasteAllowed(TRUE);
++         }
++      } else {
++         delete m_copyPasteUI;
++         m_copyPasteUI = NULL;
++      }
++   }
++   return wrapper->IsCPRegistered();
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::UnregisterCP --
++ *
++ *    Unregister copy paste capabilities and clean up.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::UnregisterCP()
++{
++   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
++
++   if (wrapper->IsCPRegistered()) {
++      if (m_copyPasteUI) {
++         delete m_copyPasteUI;
++         m_copyPasteUI = NULL;
++      }
++      wrapper->SetCPIsRegistered(FALSE);
++      wrapper->SetCPVersion(-1);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::RegisterDnD --
++ *
++ *    Drag and drop is delegated to DnDUIX11, which drives XDND through
++ *    Xwayland. A drag is driven by real pointer input, so it does not need the
++ *    data-control protocols. Without GTK there is no drag and drop.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++CopyPasteDnDWayland::RegisterDnD()
++{
++   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
++
++   if (!wrapper->IsDnDEnabled() || !m_haveGtk) {
++      return FALSE;
++   }
++
++   if (!wrapper->IsDnDRegistered()) {
++      m_dndUI = new DnDUIX11(wrapper->GetToolsAppCtx());
++      if (m_dndUI != NULL) {
++         if (m_dndUI->Init()) {
++            wrapper->SetDnDIsRegistered(TRUE);
++            m_dndUI->SetDnDAllowed(TRUE);
++            int version = wrapper->GetDnDVersion();
++            g_debug("%s: dnd version is %d\n", __FUNCTION__, version);
++            if (version >= 3) {
++               DnDVersionChanged(version);
++            }
++         } else {
++            delete m_dndUI;
++            m_dndUI = NULL;
++         }
++      }
++   }
++   g_debug("%s: dnd is registered? %d\n", __FUNCTION__,
++           (int) wrapper->IsDnDRegistered());
++   return wrapper->IsDnDRegistered();
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::UnregisterDnD --
++ *
++ *    Unregister drag and drop capabilities and clean up.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::UnregisterDnD()
++{
++   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
++
++   if (!wrapper->IsDnDRegistered()) {
++      return;
++   }
++   if (m_dndUI != NULL) {
++      delete m_dndUI;
++      m_dndUI = NULL;
++   }
++   wrapper->SetDnDIsRegistered(FALSE);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::CopyPasteVersionChanged --
++ *
++ *    Communicate a copy paste version change to the UI layer.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::CopyPasteVersionChanged(const int version)
++{
++   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
++   ToolsAppCtx *ctx = wrapper->GetToolsAppCtx();
++
++   g_debug("%s: version %d\n", __FUNCTION__, version);
++   if (ctx != NULL && m_copyPasteUI != NULL) {
++      m_copyPasteUI->VmxCopyPasteVersionChanged(ctx->rpc, version);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::DnDVersionChanged --
++ *
++ *    Communicate a drag and drop version change to the UI layer.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::DnDVersionChanged(const int version)
++{
++   CopyPasteDnDWrapper *wrapper = CopyPasteDnDWrapper::GetInstance();
++   ToolsAppCtx *ctx = wrapper->GetToolsAppCtx();
++
++   if (m_dndUI == NULL || ctx == NULL) {
++      return;
++   }
++   g_debug("%s: calling VmxDnDVersionChanged (version %d)\n",
++           __FUNCTION__, version);
++   m_dndUI->VmxDnDVersionChanged(ctx->rpc, version);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::SetCopyPasteAllowed --
++ *
++ *    Communicate copy paste allowed state to the UI layer.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::SetCopyPasteAllowed(bool allowed)
++{
++   if (m_copyPasteUI != NULL) {
++      m_copyPasteUI->SetCopyPasteAllowed(allowed);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::SetDnDAllowed --
++ *
++ *    Communicate drag and drop allowed state to the UI layer.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteDnDWayland::SetDnDAllowed(bool allowed)
++{
++   if (m_dndUI != NULL) {
++      m_dndUI->SetDnDAllowed(allowed);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteDnDWayland::GetCaps --
++ *
++ *    Report what this backend supports, which is copy and paste of text, RTF
++ *    and PNG images.
++ *
++ *    Copy and paste owns the Wayland selection directly, so one selection can
++ *    carry rich text and its plain rendering at once.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++uint32
++CopyPasteDnDWayland::GetCaps()
++{
++   return DND_CP_CAP_VALID |
++          DND_CP_CAP_CP |
++          DND_CP_CAP_PLAIN_TEXT_CP |
++          DND_CP_CAP_RTF_CP |
++          DND_CP_CAP_IMAGE_CP |
++          DND_CP_CAP_ACTIVE_CP |
++          DND_CP_CAP_BIG_BUFFER;
++}
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+new file mode 100644
+index 0000000..d157a29
+--- /dev/null
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp
+@@ -0,0 +1,239 @@
++/*********************************************************
++ * Copyright (C) 2026 GoProSlowYo
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation version 2.1 and no later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
++ *
++ *********************************************************/
++
++/**
++ * @file copyPasteUIWayland.cpp
++ *
++ * Wayland implementation of host<->guest copy/paste, derived from
++ * copyPasteUIX11.cpp. Rather than owning an X selection through GtkClipboard,
++ * the local selection is owned through ext-data-control-v1 in
++ * waylandClipboard.c. A data control client needs no keyboard focus, unlike
++ * the core wl_data_device protocol that GtkClipboard uses on Wayland. That is
++ * what allows a background daemon to bridge the clipboard.
++ */
++
++#define G_LOG_DOMAIN "dndcp"
++
++#include <glib.h>
++#include <string.h>
++
++#include "vmware.h"
++#include "copyPasteUIWayland.h"
++#include "waylandClipboard.h"
++#include "guestDnDCPMgr.hh"
++#include "dndMsg.h"
++
++extern "C" {
++#include "file.h"
++#include "str.h"
++#include "util.h"
++#include "dndCPMsgV4.h"
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::CopyPasteUIWayland --
++ *
++ *    Constructor.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++CopyPasteUIWayland::CopyPasteUIWayland()
++ : mCP(NULL),
++   mInited(false)
++{
++   GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
++   ASSERT(p);
++   mCP = p->GetCopyPasteMgr();
++   ASSERT(mCP);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::~CopyPasteUIWayland --
++ *
++ *    Destructor.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++CopyPasteUIWayland::~CopyPasteUIWayland()
++{
++   WaylandClipboard_Exit();
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::Init --
++ *
++ *    Take the local selection through ext-data-control-v1 and connect to
++ *    the common-layer copy/paste signals.
++ *    The RPC transport runs on the toolbox GLib main loop.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++CopyPasteUIWayland::Init()
++{
++   if (mInited) {
++      return true;
++   }
++
++   /*
++    * Own the selection directly when the compositor implements
++    * ext-data-control-v1.
++    */
++   if (WaylandClipboard_Init()) {
++      g_debug("%s: using the native Wayland selection\n", __FUNCTION__);
++   } else {
++      g_warning("%s: the compositor does not offer ext-data-control-v1, "
++                "copy and paste is disabled\n", __FUNCTION__);
++   }
++
++   mCP->srcRecvClipChanged.connect(
++      sigc::mem_fun(this, &CopyPasteUIWayland::GetRemoteClipboardCB));
++
++   mInited = true;
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::VmxCopyPasteVersionChanged --
++ *
++ *    Update version information in mCP.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::VmxCopyPasteVersionChanged(RpcChannel *chan,  // IN: unused
++                                               uint32 version)    // IN
++{
++   ASSERT(mCP);
++   g_debug("%s: new version is %d\n", __FUNCTION__, version);
++   mCP->VmxCopyPasteVersionChanged(version);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::GetRemoteClipboardCB --
++ *
++ *    Invoked when the host sends clipboard contents. Offer what it sent on
++ *    the local Wayland selection.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
++{
++   void *buf = NULL;
++   size_t sz = 0;
++
++   if (clip == NULL) {
++      g_debug("%s: no clipboard contents.\n", __FUNCTION__);
++      return;
++   }
++
++   /*
++    * Log every format the host offered. The host may attach a text rendering,
++    * such as a filename or URL, to an image copy, so the order in which the
++    * formats are consumed decides which one is used.
++    */
++   g_debug("%s: host clip offers:%s%s%s%s\n", __FUNCTION__,
++           CPClipboard_ItemExists(clip, CPFORMAT_IMG_PNG)  ? " png"   : "",
++           CPClipboard_ItemExists(clip, CPFORMAT_TEXT)     ? " text"  : "",
++           CPClipboard_ItemExists(clip, CPFORMAT_RTF)      ? " rtf"   : "",
++           CPClipboard_ItemExists(clip, CPFORMAT_FILELIST) ? " files" : "");
++
++   /*
++    * Offer every format the host sent in one selection, so an application
++    * asking for rich text gets RTF while one asking for plain text gets the
++    * text rendering. The X11 backend offers text and RTF together the same
++    * way.
++    */
++   std::vector<WaylandClipItem> items;
++   void *rtfBuf = NULL;
++   size_t rtfSz = 0;
++   void *imgBuf = NULL;
++   size_t imgSz = 0;
++   const char *text = NULL;
++   gsize textLen = 0;
++   bool haveImg = false;
++   bool haveRtf = false;
++
++   if (CPClipboard_GetItem(clip, CPFORMAT_IMG_PNG, &imgBuf, &imgSz) &&
++       imgBuf != NULL && imgSz > 0) {
++      haveImg = true;
++      items.push_back({ "image/png", imgBuf, imgSz });
++   }
++   if (CPClipboard_GetItem(clip, CPFORMAT_RTF, &rtfBuf, &rtfSz) &&
++       rtfBuf != NULL && rtfSz > 0) {
++      haveRtf = true;
++      items.push_back({ TARGET_NAME_TEXT_RTF, rtfBuf, rtfSz });
++      items.push_back({ TARGET_NAME_APPLICATION_RTF, rtfBuf, rtfSz });
++   }
++   if (CPClipboard_GetItem(clip, CPFORMAT_TEXT, &buf, &sz) &&
++       buf != NULL && sz > 0) {
++      /*
++       * CPFORMAT_TEXT is NUL terminated UTF-8 and sz includes the terminator.
++       * Do not put the trailing NUL on the Wayland selection.
++       */
++      text = (const char *) buf;
++      textLen = (gsize) sz;
++      if (textLen > 0 && text[textLen - 1] == '\0') {
++         textLen--;
++      }
++      items.push_back({ "text/plain;charset=utf-8", text, textLen });
++      items.push_back({ "text/plain", text, textLen });
++      items.push_back({ "UTF8_STRING", text, textLen });
++   }
++
++   if (items.empty()) {
++      g_debug("%s: nothing usable in the remote clipboard\n", __FUNCTION__);
++      return;
++   }
++
++   g_debug("%s: offering %d formats locally\n", __FUNCTION__,
++           (int) items.size());
++
++   bool ok = false;
++   if (WaylandClipboard_IsAvailable()) {
++      ok = WaylandClipboard_Offer(&items[0], items.size());
++   }
++
++   if (!ok) {
++      g_warning("%s: could not install the local selection\n", __FUNCTION__);
++      return;
++   }
++}
++
++
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.h b/services/plugins/dndcp/copyPasteUIWayland.h
+new file mode 100644
+index 0000000..7249a4f
+--- /dev/null
++++ b/services/plugins/dndcp/copyPasteUIWayland.h
+@@ -0,0 +1,68 @@
++/*********************************************************
++ * Copyright (C) 2026 GoProSlowYo
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation version 2.1 and no later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
++ *
++ *********************************************************/
++
++/**
++ * @file copyPasteUIWayland.h
++ *
++ * This class implements host<->guest copy/paste (version 3+ of the protocol)
++ * for Wayland sessions. The local selection is owned through
++ * ext-data-control-v1 where the compositor implements it. This is the
++ * counterpart of copyPasteUIX11.h for the Wayland platform.
++ *
++ * Text, RTF and PNG images are supported.
++ */
++
++#ifndef __COPYPASTE_UI_WAYLAND_H__
++#define __COPYPASTE_UI_WAYLAND_H__
++
++#include <string>
++#include <vector>
++#include <glib.h>
++#include <gdk/gdk.h>
++#include <sigc++/trackable.h>
++
++#include "vm_basic_types.h"
++#include "dnd.h"
++
++extern "C" {
++#include "dndClipboard.h"
++#include "vmware/tools/guestrpc.h"
++}
++
++#include "guestCopyPaste.hh"
++
++class CopyPasteUIWayland
++   : public sigc::trackable
++{
++public:
++   CopyPasteUIWayland();
++   virtual ~CopyPasteUIWayland();
++   bool Init();
++   void VmxCopyPasteVersionChanged(RpcChannel *chan, uint32 version);
++   void SetCopyPasteAllowed(bool isCopyPasteAllowed)
++   { mCP->SetCopyPasteAllowed(isCopyPasteAllowed); }
++
++private:
++   /* Called when the host sends new clipboard contents. */
++   void GetRemoteClipboardCB(const CPClipboard *clip);
++
++   GuestCopyPasteMgr *mCP;
++   bool mInited;
++};
++
++#endif // __COPYPASTE_UI_WAYLAND_H__
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+new file mode 100644
+index 0000000..fc6f211
+--- /dev/null
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+@@ -0,0 +1,73 @@
++/*********************************************************
++ * Copyright (C) 2026 GoProSlowYo
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation version 2.1 and no later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
++ *
++ *********************************************************/
++
++/**
++ * @file copyPasteDnDWayland.h
++ *
++ * Concrete CopyPasteDnDImpl for Wayland sessions. Copy and paste is driven
++ * by CopyPasteUIWayland, which owns the Wayland selection through
++ * ext-data-control-v1. Drag and drop is delegated to DnDUIX11, which runs its
++ * detection window under Xwayland. The RPC transport runs on the toolbox
++ * GLib main loop.
++ */
++
++#ifndef __COPYPASTEDNDWAYLAND_H__
++#define __COPYPASTEDNDWAYLAND_H__
++
++#include "vm_basic_types.h"
++#include "dnd.h"
++#ifdef GTK4
++#include <gtkmm/application.h>
++#include "dndUIX11GTK4.h"
++#else
++#include "dndUIX11.h"
++#endif
++#include <gtk/gtk.h>
++#include "copyPasteDnDImpl.h"
++
++class CopyPasteUIWayland;
++
++class CopyPasteDnDWayland : public CopyPasteDnDImpl
++{
++public:
++   CopyPasteDnDWayland();
++   ~CopyPasteDnDWayland();
++   virtual gboolean Init(ToolsAppCtx *ctx);
++   virtual void PointerInit();
++   virtual gboolean RegisterCP();
++   virtual void UnregisterCP();
++   virtual gboolean RegisterDnD();
++   virtual void UnregisterDnD();
++   virtual void CopyPasteVersionChanged(const int version);
++   virtual void DnDVersionChanged(const int version);
++   virtual void SetCopyPasteAllowed(bool allowed);
++   virtual void SetDnDAllowed(bool allowed);
++   virtual uint32 GetCaps();
++
++private:
++   ToolsAppCtx *m_ctx;
++   CopyPasteUIWayland *m_copyPasteUI;
++   DnDUIX11 *m_dndUI;
++#if defined(GTK3)
++   Gtk::Main *m_main;
++#endif
++   /* GTK is up on an X display. Drag and drop needs it. */
++   bool m_haveGtk;
++};
++
++#endif // __COPYPASTEDNDWAYLAND_H__
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWrapper.cpp b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWrapper.cpp
+index a4716d7..a011994 100644
+--- a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWrapper.cpp
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWrapper.cpp
+@@ -28,6 +28,9 @@
+ 
+ #if defined(HAVE_GTKMM)
+ #include "copyPasteDnDX11.h"
++#if defined(HAVE_WAYLAND)
++#include "copyPasteDnDWayland.h"
++#endif
+ #endif
+ 
+ #if defined(WIN32)
+@@ -149,8 +152,30 @@ CopyPasteDnDWrapper::Init(ToolsAppCtx *ctx)
+ 
+    if (!m_pimpl) {
+ #if defined(HAVE_GTKMM)
++#if defined(HAVE_WAYLAND)
++      /*
++       * Use the Wayland backend in a Wayland session. The X11 backend works
++       * through X selections under Xwayland, which do not reach native
++       * Wayland applications from this windowless daemon on every
++       * compositor. The choice is made at run time so that one build serves
++       * both kinds of session. Wayland is chosen when WAYLAND_DISPLAY is set
++       * and the session is not an X11 one. A compositor started from a text
++       * console, such as sway, leaves XDG_SESSION_TYPE at "tty", and an
++       * X11 session that happens to export WAYLAND_DISPLAY says "x11".
++       */
++      if (g_getenv("WAYLAND_DISPLAY") != NULL &&
++          (g_getenv("DISPLAY") == NULL ||
++           g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "x11") != 0)) {
++         g_debug("%s: Wayland session detected, using Wayland CP backend.\n",
++                 __FUNCTION__);
++         m_pimpl = new CopyPasteDnDWayland();
++      } else {
++         m_pimpl = new CopyPasteDnDX11();
++      }
++#else
+       m_pimpl = new CopyPasteDnDX11();
+ #endif
++#endif
+ #if defined(WIN32)
+ #ifdef DND_VM
+       m_pimpl = new VMCopyPasteDnDWin32();
+-- 
+2.55.0
+

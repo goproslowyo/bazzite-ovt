@@ -1,0 +1,958 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:11 -0700
+Subject: [PATCH 16/21] dndcp: Use the native Wayland drag for host to guest
+ drags
+
+Where waylandDrag/ has connected, DnDUIX11 starts a host to guest drag
+as a native Wayland drag and falls back to XDND otherwise.
+LocalSetContentProvider() now collects the formats once, and both drag
+sources offer the same MIME types and bytes. On the first motion the
+plugin arms the overlays, hides the detection window, and presses
+through uinput. FakeMouse_Button(), new here, skips the 100 ms pause
+that FakeMouse_Click() takes for GTK's drag detection. The host's RPC
+messages wait behind any sleep, and the user can let go of a quick drag
+in that time.
+
+If a drag cannot start from the press, the button is released and the
+detection window is mapped again for the XDND drag, which then waits for
+the window manager to adopt the window before it presses. A failure of
+WaylandDrag_Init() for a reason other than a missing global, such as a
+compositor that has not yet announced its outputs, is retried at the
+start of the next host drag.
+
+Send the host drag feedback before starting the drag rather than after.
+The host chooses between a drop and a cancel from the feedback it has
+when the user lets go, and the user can let go of a quick drag while the
+overlay is still being mapped.
+
+OnSrcDrop() must not show, raise or warp over the Xwayland detection
+window during a native drag. Even after the target has accepted, any of
+those makes the compositor cancel the drag instead of dropping. It moves
+the pointer and releases the button through uinput only.
+
+Read the Wayland connection between the host's motions too. The motions
+come in bursts that the RPC channel handles in one go. When a target
+asks for the offer's contents on entering, and the pointer has left it
+again before they arrive, GTK reports a failed transfer, and libfm 1.4.1
+then dereferences NULL.
+
+A Wayland drag emits none of the GtkDragSource signals, so
+OnWaylandDragDone() releases the faked press when the drag ends without
+a host drop. Each native drag carries a generation number, so that the
+end of an abandoned drag is not taken for the end of the next one. A new
+host drag, a reset or a host cancel ends a native drag that is still
+running.
+
+In a build without Wayland support waylandDrag/waylandDragStub.c
+provides the functions, and a native drag is never available.
+---
+ services/plugins/dndcp/Makefile.am            |   4 +
+ .../plugins/dndcp/copyPasteDnDWayland.cpp     |  13 +-
+ .../dndcp/dndGuestBase/copyPasteDnDWayland.h  |   4 +-
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |  37 +-
+ services/plugins/dndcp/dndUIX11GTK4.cpp       | 461 +++++++++++++++---
+ .../fakeMouseWayland/fakeMouseWayland.cpp     |  31 +-
+ .../dndcp/fakeMouseWayland/fakeMouseWayland.h |   1 +
+ .../dndcp/waylandDrag/waylandDragStub.c       |  81 +++
+ 8 files changed, 554 insertions(+), 78 deletions(-)
+ create mode 100644 services/plugins/dndcp/waylandDrag/waylandDragStub.c
+
+diff --git a/services/plugins/dndcp/Makefile.am b/services/plugins/dndcp/Makefile.am
+index 8ab6c68..60c46e8 100644
+--- a/services/plugins/dndcp/Makefile.am
++++ b/services/plugins/dndcp/Makefile.am
+@@ -124,6 +124,10 @@ libdndcp_la_SOURCES += copyPasteDnDWayland.cpp
+ libdndcp_la_SOURCES += copyPasteUIWayland.cpp
+ libdndcp_la_SOURCES += waylandClipboard/waylandClipboard.c
+ libdndcp_la_SOURCES += waylandDrag/waylandDrag.c
++else
++# Without Wayland support a native drag is never available and dndUIX11GTK4
++# uses XDND.
++libdndcp_la_SOURCES += waylandDrag/waylandDragStub.c
+ endif
+ 
+ if LINUX
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+index cc492e5..2edc0ee 100644
+--- a/services/plugins/dndcp/copyPasteDnDWayland.cpp
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+@@ -120,9 +120,10 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
+     * Drag and drop is delegated to DnDUIX11, which needs GTK on its X11
+     * backend. Under a Wayland session that makes the detection window an
+     * Xwayland client. DnDUIX11 then uses XDND, which the compositor bridges
+-    * to native clients. The X11-specific code would crash on a Wayland
+-    * GdkSurface. This mirrors CopyPasteDnDX11::Init. Where the compositor has
+-    * no ext-data-control-v1, copy and paste owns the X selection through GDK
++    * to native clients, or a native Wayland drag source where layer shell
++    * exists. The X11-specific code would crash on a Wayland GdkSurface. This
++    * mirrors CopyPasteDnDX11::Init. Where the compositor has no
++    * ext-data-control-v1, copy and paste owns the X selection through GDK
+     * and learns from GDK when the selection changes.
+     */
+    gdk_set_allowed_backends("x11");
+@@ -262,8 +263,10 @@ CopyPasteDnDWayland::UnregisterCP()
+  *
+  * CopyPasteDnDWayland::RegisterDnD --
+  *
+- *    Drag and drop is delegated to DnDUIX11, which drives XDND through
+- *    Xwayland. A drag is driven by real pointer input, so it does not need the
++ *    Drag and drop is delegated to DnDUIX11. For a host to guest drag it uses
++ *    a native Wayland drag source from a layer shell surface where the
++ *    compositor offers wlr-layer-shell, and XDND through Xwayland otherwise.
++ *    A drag is driven by real pointer input, so it does not need the
+  *    data-control protocols. Without GTK there is no drag and drop.
+  *
+  *-----------------------------------------------------------------------------
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+index 8a2d32a..af85f6e 100644
+--- a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+@@ -24,7 +24,9 @@
+  * ext-data-control-v1, or else the X selection through GDK, which the
+  * compositor keeps in step with the Wayland one, or else through wl-copy.
+  * Drag and drop is delegated to DnDUIX11, which runs its detection window
+- * under Xwayland. The RPC transport runs on the toolbox GLib main loop.
++ * under Xwayland and adds a native Wayland drag source where the compositor
++ * offers wlr-layer-shell. The RPC transport runs on the toolbox GLib main
++ * loop.
+  */
+ 
+ #ifndef __COPYPASTEDNDWAYLAND_H__
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index c60c54e..d1cd78e 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -93,7 +93,8 @@ private:
+    void LocalRefuseDrag(void);
+    void LocalGetFileRequest(utf::string stagingDirName, const char *desktop);
+    void LocalGetFileContentsRequest(const char *desktop);
+-   void LocalSetContentProvider(const char* desktop);
++   void AddDragItem(const char *mimeType, const void *data, size_t size);
++   void LocalSetContentProvider();
+ 
+    /*
+     * Callbacks from Common DnD layer.
+@@ -122,13 +123,24 @@ private:
+ 
+    /*
+     * The role the detection window plays while it is shown. A drag has to
+-    * find a drop target, but nothing has to find a drag source.
++    * find a drop target, and a press has to find the window it is meant
++    * for, but nothing has to find a drag source.
+     */
+    typedef enum {
+       DET_WND_DROP_TARGET,
++      DET_WND_PRESS_TARGET,
+       DET_WND_DRAG_SOURCE
+    } DetWndRole;
+ 
++   /*
++    * One format of what the host is dragging. Both drag sources offer the
++    * same bytes under the same MIME types, so they are collected once.
++    */
++   typedef struct {
++      std::string mimeType;
++      std::string data;    /* Raw bytes, which may include NULs. */
++   } DragItem;
++
+    /*
+     * Callbacks for showing/hiding detection window.
+     */
+@@ -138,6 +150,21 @@ private:
+    void SourceDragStartDone();
+    void SourceUpdateFeedback(DND_DROPEFFECT effect);
+ 
++   /* Native Wayland drag source, where the compositor supports one. */
++   bool LocalStartWaylandDrag(int32 x, int32 y);
++   void LocalCancelWaylandDrag(void);
++   static void OnWaylandDragDone(void *ctx);
++
++   /*
++    * The argument to the native drag's done(). It records which drag it was,
++    * so that the end of an abandoned drag is not taken for the end of the
++    * next one. OnWaylandDragDone() frees it.
++    */
++   typedef struct {
++      DnDUIX11 *ui;
++      unsigned int gen;
++   } WaylandDragTicket;
++
+    /*
+     * Gtk+ Callbacks: Drag Source
+     */
+@@ -213,6 +240,10 @@ private:
+    bool mHGDragStarted;
+    /* A faked press is outstanding; it must not outlive the drag. */
+    bool mHGButtonDown;
++   /* A native Wayland drag is running, so the XDND teardown must not run. */
++   bool mWaylandDragActive;
++   /* Which native drag is current; a done() for any other is ignored. */
++   unsigned int mWaylandDragGen;
+    DND_DROPEFFECT mEffect;
+    int32 mMousePosX;
+    int32 mMousePosY;
+@@ -223,6 +254,8 @@ private:
+    /* GdkSurface used in dnd */
+    Glib::RefPtr< Gdk::Surface > mGdkSurface;
+    Glib::RefPtr<Gdk::ContentProvider> mProvider;
++   /* The same formats the provider carries, for the Wayland drag source. */
++   std::vector<DragItem> mDragItems;
+    utf::string mHGDndUriList;
+    utf::utf8string mHGFCPData;
+ 
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index d7af0fd..5c99dfd 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -54,6 +54,15 @@ extern "C" {
+ #endif
+ 
+ #include "copyPasteDnDWrapper.h"
++#include "waylandDrag.h"
++
++/*
++ * How long to wait for the compositor to deliver a faked press. The wait
++ * ends as soon as the press arrives. The full time passes only when the
++ * compositor sent the press somewhere else, and the drag then falls back to
++ * XDND.
++ */
++#define WAYLAND_DRAG_PRESS_TIMEOUT_MS 250
+ 
+ 
+ /*
+@@ -80,6 +89,8 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
+       mGHReads(NULL),
+       mInHGDrag(false),
+       mHGButtonDown(false),
++      mWaylandDragActive(false),
++      mWaylandDragGen(0),
+       mEffect(DROP_NONE),
+       mMousePosX(0),
+       mMousePosY(0),
+@@ -145,6 +156,12 @@ DnDUIX11::~DnDUIX11()
+       }
+    }
+    ResetUI();
++   /*
++    * Also for a drag that is armed but has not started. Any done() from
++    * WaylandDrag_Exit() then finds a stale ticket.
++    */
++   LocalCancelWaylandDrag();
++   WaylandDrag_Exit();
+ }
+ 
+ 
+@@ -203,6 +220,13 @@ DnDUIX11::Init()
+ #undef CONNECT_SIGNAL
+ 
+    mDetWnd->UpdateDetWnd(false, 0, 0);
++
++   /*
++    * Optional. Where the compositor does not support a native drag source,
++    * host to guest drags use XDND. OnSrcDragBegin() tries again if this
++    * fails.
++    */
++   WaylandDrag_Init();
+    goto out;
+ fail:
+    ret = false;
+@@ -267,6 +291,14 @@ void
+ DnDUIX11::ResetUI()
+ {
+    TRACE_CALL();
++   /*
++    * The button is about to be released, and a native drag would take that
++    * as the drop. The caller of the reset has decided the drag is over, so
++    * cancel the drag rather than drop it on whatever is under the pointer.
++    */
++   if (mWaylandDragActive) {
++      LocalCancelWaylandDrag();
++   }
+    /*
+     * The press faked to start a host to guest drag is released by the host
+     * when it drops. If the drag never started there is nothing to drop, and
+@@ -375,50 +407,94 @@ DnDUIX11::RemoveBlock()
+ /*
+  *-----------------------------------------------------------------------------
+  *
+- * DnDUIX11::LocalSetContentProvider --
++ * DnDUIX11::AddDragItem --
+  *
+- *      Set content provider based on different desktop type.
+- *
+- * Results:
+- *      None.
++ *      Record one format of what the host is dragging.
+  *
+  * Side effects:
+- *      mProvider is chanaged.
++ *      mDragItems grows.
+  *
+  *-----------------------------------------------------------------------------
+  */
+ 
+ void
+-DnDUIX11::LocalSetContentProvider(const char* desktop)   // IN
++DnDUIX11::AddDragItem(const char *mimeType,  // IN
++                      const void *data,      // IN
++                      size_t size)           // IN
++{
++   DragItem item;
++
++   item.mimeType = mimeType;
++   item.data.assign(static_cast<const char *>(data), size);
++   mDragItems.push_back(item);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalSetContentProvider --
++ *
++ *      Collect what the host is dragging, once, for both drag sources.
++ *
++ *      The Wayland source offers the same MIME types and bytes as the Gtk
++ *      one, and the source is chosen only when the drag starts. The formats
++ *      are therefore collected here, and the provider is built from them.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      mDragItems and mProvider are replaced.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalSetContentProvider()
+ {
+    std::vector<Glib::RefPtr<Gdk::ContentProvider>> providerVec;
+-   Glib::RefPtr<Glib::Bytes> fileList;
+    void *buf;
+    size_t sz;
+ 
+    g_debug("%s: enter.\n", __FUNCTION__);
+ 
++   mDragItems.clear();
++
+    if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILELIST) ||
+        CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILECONTENTS)) {
+-      /* The caller has already framed the list for this desktop. */
+-      fileList = Glib::Bytes::create(mHGDndUriList.c_str(), mHGDndUriList.bytes());
+-      providerVec.push_back(Gdk::ContentProvider::create(DRAG_TARGET_NAME_URI_LIST, fileList));
++      /*
++       * The caller has already framed the list for this desktop. Do not
++       * offer an empty list. A target that asks for the type and gets
++       * nothing sees a successful transfer of zero bytes, which GTK turns
++       * into a NULL vector.
++       */
++      if (mHGDndUriList.bytes() > 0) {
++         AddDragItem(DRAG_TARGET_NAME_URI_LIST, mHGDndUriList.c_str(),
++                     mHGDndUriList.bytes());
++      } else {
++         g_debug("%s: the host's file list came out empty\n", __FUNCTION__);
++      }
+    } else if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_RTF)) {
+       if (CPClipboard_GetItem(&mClipboard, CPFORMAT_RTF, &buf, &sz)) {
+          g_debug("%s: RTF data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
+-         Glib::RefPtr<Glib::Bytes> rtfData = Glib::Bytes::create(buf, sz);
+-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_APPLICATION_RTF, rtfData));
+-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_RICHTEXT, rtfData));
+-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_RTF, rtfData));
++         AddDragItem(TARGET_NAME_APPLICATION_RTF, buf, sz);
++         AddDragItem(TARGET_NAME_TEXT_RICHTEXT, buf, sz);
++         AddDragItem(TARGET_NAME_TEXT_RTF, buf, sz);
+       }
+    } else if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_TEXT)) {
+       if (CPClipboard_GetItem(&mClipboard, CPFORMAT_TEXT, &buf, &sz)) {
+          g_debug("%s: Text data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
+-         Glib::RefPtr<Glib::Bytes> textData = Glib::Bytes::create(buf, sz);
+-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN, textData));
+-         providerVec.push_back(Gdk::ContentProvider::create(TARGET_NAME_TEXT_PLAIN_UTF8, textData));
++         AddDragItem(TARGET_NAME_TEXT_PLAIN, buf, sz);
++         AddDragItem(TARGET_NAME_TEXT_PLAIN_UTF8, buf, sz);
+       }
+    }
++
++   for (const DragItem &item : mDragItems) {
++      providerVec.push_back(
++         Gdk::ContentProvider::create(item.mimeType,
++            Glib::Bytes::create(item.data.data(), item.data.size())));
++   }
+    mProvider = Gdk::ContentProvider::create(providerVec);
+ }
+ 
+@@ -688,6 +764,23 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+    bool hasContent = false;
+    mHGDragStarted = false;
+ 
++   /*
++    * A native drag that the host has finished with can still be waiting for
++    * the target or the compositor. While it runs, this drag's first motion
++    * would fall back to XDND, and its end would arrive in the middle of this
++    * drag.
++    */
++   LocalCancelWaylandDrag();
++
++   /*
++    * The compositor may have been slow to answer at login, or its
++    * connection may have dropped since. WaylandDrag_Init() returns at once
++    * outside Wayland and where the compositor lacks what a native drag needs.
++    */
++   if (!WaylandDrag_IsAvailable()) {
++      WaylandDrag_Init();
++   }
++
+    /* The host's coordinates are for the screen as it is now. */
+    mDetWnd->RefreshScreenSize();
+ 
+@@ -709,6 +802,13 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+    size_t sz;
+ 
+    mHGFCPData.clear();
++   /*
++    * LocalSetContentProvider() replaces these only when the host sent a
++    * format that is offered here. For a drag with none, both drag sources
++    * would otherwise offer the previous drag's data.
++    */
++   mDragItems.clear();
++   mProvider.reset();
+ 
+    if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILELIST, &buf, &sz)) {
+       mHGStagingDir = utf::string(stagingDir.c_str());
+@@ -771,7 +871,7 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+ 
+    /* finally set the guest clipboard */
+    if (hasContent) {
+-      LocalSetContentProvider(desktop);
++      LocalSetContentProvider();
+    }
+ 
+    SourceDragStartDone();
+@@ -781,6 +881,183 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::OnWaylandDragDone --
++ *
++ *      The native drag ended, whatever the reason.
++ *
++ *      A Wayland drag emits none of the GtkDragSource signals, so when the
++ *      drag ends without a host drop, only this function releases the faked
++ *      press. Without it the uinput button stays down for the rest of the
++ *      session and the desktop looks frozen.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::OnWaylandDragDone(void *ctx)   // IN: a WaylandDragTicket
++{
++   WaylandDragTicket *ticket = (WaylandDragTicket *)ctx;
++   DnDUIX11 *this_instance = ticket->ui;
++   bool current = ticket->gen == this_instance->mWaylandDragGen;
++
++   TRACE_CALL();
++   delete ticket;
++   /*
++    * The host returns to READY without waiting for the compositor, on a
++    * cancel, on GET_FILES_DONE and on a drop of anything but files. The next
++    * drag can be running by the time this drag's end arrives, and a reset
++    * then would release the new drag's button in the middle of it.
++    */
++   if (!current) {
++      g_debug("%s: the end of a drag already given up\n", __FUNCTION__);
++      return;
++   }
++   this_instance->mWaylandDragActive = false;
++   if (this_instance->mHGGetFileStatus != DND_FILE_TRANSFER_IN_PROGRESS) {
++      this_instance->ResetUI();
++   } else if (this_instance->mHGButtonDown) {
++      /*
++       * A file drop keeps its staging state until the transfer is done. The
++       * drag itself is over, and the host drop that would release the
++       * button may never come.
++       */
++      g_debug("%s: releasing the faked button\n", __FUNCTION__);
++#ifdef USE_UINPUT
++      FakeMouse_Click(false);
++#endif
++      this_instance->mHGButtonDown = false;
++   }
++   this_instance->mInHGDrag = false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalStartWaylandDrag --
++ *
++ *      Start the host to guest drag as a native Wayland drag.
++ *
++ * Results:
++ *      True if the compositor took the drag. The button then stays down
++ *      until OnSrcDrop() or OnWaylandDragDone() releases it. False leaves no
++ *      native drag behind and the button up, and the caller falls back to
++ *      XDND.
++ *
++ * Side effects:
++ *      Fakes a pointer press.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DnDUIX11::LocalStartWaylandDrag(int32 x,   // IN: pointer x-coord
++                                int32 y)   // IN: pointer y-coord
++{
++#ifdef USE_UINPUT
++   std::vector<WaylandDragItem> items;
++
++   if (!WaylandDrag_IsAvailable() || !FakeMouse_IsInit() ||
++       mDragItems.empty()) {
++      return false;
++   }
++
++   for (const DragItem &item : mDragItems) {
++      WaylandDragItem wItem;
++
++      wItem.mimeType = item.mimeType.c_str();
++      wItem.data = item.data.data();
++      wItem.size = item.data.size();
++      items.push_back(wItem);
++   }
++
++   if (!WaylandDrag_Arm(&items[0], items.size())) {
++      return false;
++   }
++
++   /*
++    * The detection window has no part in a native drag, and under Xwayland
++    * the compositor treats it like any other window. Left mapped at the
++    * corner of the work area, it can be offered the drop itself, and the
++    * drop is lost.
++    */
++   ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
++
++   /*
++    * Use uinput directly rather than SimulateXEvents(), which also shows,
++    * moves and raises the X11 detection window and warps the X pointer. That
++    * all serves XDND. Raising an Xwayland window under the cursor would also
++    * take the press away from the overlay.
++    *
++    * FakeMouse_Button() skips the pause that FakeMouse_Click() takes after
++    * each button event for GTK's drag detection.
++    * WaylandDrag_StartOnPress() below waits for the press on the Wayland
++    * connection instead. The host's RPC messages wait behind any sleep here.
++    * If the user lets go of a quick drag during the sleep, the host cancels
++    * the drag before the guest drag has started.
++    */
++   FakeMouse_Button(false);
++   FakeMouse_Move(x, y);
++   FakeMouse_Move(x + 1, y + 1);
++   FakeMouse_Button(true);
++
++   WaylandDragTicket *ticket = new WaylandDragTicket;
++
++   ticket->ui = this;
++   ticket->gen = ++mWaylandDragGen;
++   if (!WaylandDrag_StartOnPress(WAYLAND_DRAG_PRESS_TIMEOUT_MS,
++                                 OnWaylandDragDone, ticket)) {
++      /* done() is never called for a drag that did not start. */
++      delete ticket;
++      WaylandDrag_Disarm();
++      /*
++       * The press went to some other surface. Let go of it, and map the
++       * detection window again for the XDND drag the caller falls back to.
++       * The window manager adopts the window some time after the map, and a
++       * press before that lands on whatever is under the pointer.
++       */
++      FakeMouse_Button(false);
++      ShowDetWnd(true, mOriginX, mOriginY, DET_WND_PRESS_TARGET);
++      return false;
++   }
++
++   mWaylandDragActive = true;
++   g_debug("%s: dragging %" FMTSZ "u formats natively\n", __FUNCTION__,
++           (size_t)items.size());
++
++   return true;
++#else
++   return false;
++#endif
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalCancelWaylandDrag --
++ *
++ *      End the native drag, if there is one, and forget it.
++ *
++ * Side effects:
++ *      Any later done(), including the one this causes, is stale and
++ *      ignored, so the caller does its own cleanup.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalCancelWaylandDrag(void)
++{
++   mWaylandDragGen++;
++   mWaylandDragActive = false;
++   WaylandDrag_Cancel();
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -804,60 +1081,88 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+    mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
+    mMousePosX = x;
+    mMousePosY = y;
++#ifdef USE_UINPUT
++   if (mWaylandDragActive) {
++      /* Serve the target between host motions. See WaylandDrag_Pump(). */
++      WaylandDrag_Pump();
++   }
++#endif
+ 
+    if (mInHGDrag) {
+-      if (!mHGDragStarted) {
+-         /*
+-          * We want to simulate the mouse press and hold to trigger drag_begin
+-          * event for GtkDragSource, do it here rather than SrcDragBegin as
+-          * we want to get the mouse position.
+-          *
+-          * Before the DnD, we should make sure that the mouse is released
+-          * otherwise it may be another DnD, not ours. Send a release, then
+-          * a press here to cover this case.
+-          */
+-         int detX = 0, detY = 0, detW = 0, detH = 0;
+-         int pressX = x, pressY = y;
+-
+-         /*
+-          * GTK starts the drag from a press followed by motion on the
+-          * detection window itself, so the press has to land on it. A
+-          * compositor may put the window somewhere other than the requested
+-          * position, and a tiling one does, so press where the window is.
+-          */
+-         mDetWnd->GetGeometry(detX, detY, detW, detH);
+-         if (detW > 0 && detH > 0) {
+-            pressX = detX + detW / 2;
+-            pressY = detY + detH / 2;
+-            if (pressX != x || pressY != y) {
+-               g_debug("%s: pressing on the detection window at (%d, %d), "
+-                       "not the pointer at (%d, %d)\n", __FUNCTION__,
+-                       pressX, pressY, x, y);
+-            }
+-         }
+-         mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
+-         // simulate drag mouse press
+-         mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
+-         mHGButtonDown = true;
+-         // Tell Gtk that a drag should be started from this widget.
+-         mDetWnd->StartDrag(mProvider, pressX, pressY);
+-
+-         /*
+-          * Put the pointer back where the host has it. The press had to
+-          * land on the detection window, but the drag follows the pointer
+-          * from here. Waiting for the next motion from the host leaves the
+-          * XDND handshake less time than it needs before the host drops.
+-          */
+-         if (pressX != x || pressY != y) {
+-            mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
+-         }
+-         mHGDragStarted = true;
+-      }
++      /*
++       * Send feedback to the host before starting the drag. The host
++       * chooses between a drop and a cancel from the feedback it has when
++       * the user lets go. Starting the drag maps the overlay and waits for
++       * the press, and the user can let go of a quick drag in that time.
++       * With no feedback yet, the host cancels. With feedback, the host's
++       * drop waits in the RPC queue until the drag below has started.
++       */
+       if (mEffect != DROP_MOVE) {
+          mEffect = DROP_MOVE;
+          g_debug("%s: Updating feedback\n", __FUNCTION__);
+          SourceUpdateFeedback(mEffect);
+       }
++      if (!mHGDragStarted) {
++         /*
++          * Both drag sources hold the button down from here on, and it has
++          * to be released however the drag ends.
++          */
++         mHGButtonDown = true;
++
++         /*
++          * A native Wayland drag reaches Wayland and X11 targets alike. An
++          * XDND drag from the Xwayland detection window reaches Wayland
++          * targets only where the compositor bridges it. wlroots does not, so
++          * under sway every drop onto a Wayland application is lost. Use the
++          * native source where there is one, and XDND everywhere else.
++          */
++         if (!LocalStartWaylandDrag(x, y)) {
++            /*
++             * We want to simulate the mouse press and hold to trigger
++             * drag_begin event for GtkDragSource, do it here rather than
++             * SrcDragBegin as we want to get the mouse position.
++             *
++             * Before the DnD, we should make sure that the mouse is released
++             * otherwise it may be another DnD, not ours. Send a release, then
++             * a press here to cover this case.
++             */
++            int detX = 0, detY = 0, detW = 0, detH = 0;
++            int pressX = x, pressY = y;
++
++            /*
++             * GTK starts the drag from a press followed by motion on the
++             * detection window itself, so the press has to land on it. A
++             * compositor may put the window somewhere other than the requested
++             * position, and a tiling one does, so press where the window is.
++             */
++            mDetWnd->GetGeometry(detX, detY, detW, detH);
++            if (detW > 0 && detH > 0) {
++               pressX = detX + detW / 2;
++               pressY = detY + detH / 2;
++               if (pressX != x || pressY != y) {
++                  g_debug("%s: pressing on the detection window at (%d, %d), "
++                          "not the pointer at (%d, %d)\n", __FUNCTION__,
++                          pressX, pressY, x, y);
++               }
++            }
++            mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
++            // simulate drag mouse press
++            mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
++            // Tell Gtk that a drag should be started from this widget.
++            mDetWnd->StartDrag(mProvider, pressX, pressY);
++
++            /*
++             * Put the pointer back where the host has it. The press had to
++             * land on the detection window, but the drag follows the pointer
++             * from here. Waiting for the next motion from the host leaves the
++             * XDND handshake less time than it needs before the host drops.
++             */
++            if (pressX != x || pressY != y) {
++               mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
++            }
++         }
++         mHGDragStarted = true;
++      }
+    }
+ }
+ 
+@@ -882,6 +1187,11 @@ void
+ DnDUIX11::OnSrcCancel()
+ {
+    TRACE_CALL();
++   /*
++    * A native drag would take the release below as its drop, onto whatever
++    * is under the pointer.
++    */
++   LocalCancelWaylandDrag();
+    /*
+     * Force the window to show, position the mouse over it, and release.
+     * Seems like moving the window to 0, 0 eliminates frequently observed
+@@ -1001,6 +1311,23 @@ void
+ DnDUIX11::OnSrcDrop()
+ {
+    TRACE_CALL();
++#ifdef USE_UINPUT
++   if (mWaylandDragActive) {
++      /*
++       * Showing the detection window maps and raises an Xwayland window, and
++       * SimulateXEvents() also warps the X pointer. Either one loses a native
++       * drag. Even after the target has accepted, the compositor then
++       * cancels the drag instead of dropping. Leave the detection
++       * window and the X pointer alone, and use uinput and the Wayland
++       * connection only.
++       */
++      FakeMouse_Move(mMousePosX, mMousePosY);
++      FakeMouse_Click(false);
++      mHGButtonDown = false;
++      mInHGDrag = false;
++      return;
++   }
++#endif
+    ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
+ 
+    /*
+@@ -1089,7 +1416,7 @@ DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
+        * manager. The caller passes the role because mInHGDrag is not set yet
+        * when that drag begins.
+        */
+-      mDetWnd->UpdateDetWnd(show, x, y, role == DET_WND_DROP_TARGET);
++      mDetWnd->UpdateDetWnd(show, x, y, role != DET_WND_DRAG_SOURCE);
+    } else {
+       g_debug("%s: hide\n", __FUNCTION__);
+       mDetWnd->UpdateDetWnd(show, x, y);
+diff --git a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
+index 30ddfb2..a029524 100644
+--- a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
++++ b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
+@@ -327,9 +327,9 @@ FakeMouse_Move(int x,    // IN
+ /*
+  *-----------------------------------------------------------------------------
+  *
+- * FakeMouse_Click --
++ * FakeMouse_Button --
+  *
+- *      Simulate the pointer down/up event.
++ *      Simulate the pointer down/up event, without waiting for it to be seen.
+  *
+  * Results:
+  *      True if success.
+@@ -341,7 +341,7 @@ FakeMouse_Move(int x,    // IN
+  */
+ 
+ bool
+-FakeMouse_Click(bool down)  // IN
++FakeMouse_Button(bool down)  // IN
+ {
+    if (!FakeMouse_IsInit()) {
+       return false;
+@@ -367,6 +367,31 @@ FakeMouse_Click(bool down)  // IN
+       retValue = false;
+    }
+ 
++   return retValue;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * FakeMouse_Click --
++ *
++ *      Simulate the pointer down/up event, and give userspace time to see it.
++ *
++ * Results:
++ *      True if success.
++ *
++ * Side effects:
++ *      Pointer button event is updated.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++FakeMouse_Click(bool down)  // IN
++{
++   bool retValue = FakeMouse_Button(down);
++
+    /*
+     * Insert a pause here so that userspace has time to detect this event,
+     * otherwise it will not notice the event we are about to send.
+diff --git a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h
+index 962c39f..d6c13be 100644
+--- a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h
++++ b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h
+@@ -31,6 +31,7 @@ bool FakeMouse_IsInit();
+ bool FakeMouse_Update(int width, int height);
+ void FakeMouse_Destory();
+ bool FakeMouse_Move(int x, int y);
++bool FakeMouse_Button(bool down);
+ bool FakeMouse_Click(bool down);
+ 
+ #endif // __FAKE_MOUSE_WAYLAND_H__
+diff --git a/services/plugins/dndcp/waylandDrag/waylandDragStub.c b/services/plugins/dndcp/waylandDrag/waylandDragStub.c
+new file mode 100644
+index 0000000..b7a9b26
+--- /dev/null
++++ b/services/plugins/dndcp/waylandDrag/waylandDragStub.c
+@@ -0,0 +1,81 @@
++/*********************************************************
++ * Copyright (C) 2026 GoProSlowYo
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published
++ * by the Free Software Foundation version 2.1 and no later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
++ * License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
++ *
++ *********************************************************/
++
++/*
++ * waylandDragStub.c --
++ *
++ *    The native drag source for a build without Wayland support. A native
++ *    drag is never available, so the caller always uses XDND.
++ */
++
++#include "waylandDrag.h"
++
++
++gboolean
++WaylandDrag_Init(void)
++{
++   return FALSE;
++}
++
++
++void
++WaylandDrag_Exit(void)
++{
++}
++
++
++gboolean
++WaylandDrag_IsAvailable(void)
++{
++   return FALSE;
++}
++
++
++gboolean
++WaylandDrag_Arm(const WaylandDragItem *items,  // IN: unused
++                size_t nItems)                 // IN: unused
++{
++   return FALSE;
++}
++
++
++gboolean
++WaylandDrag_StartOnPress(unsigned int timeoutMs,     // IN: unused
++                         WaylandDragDoneFunc done,   // IN: unused
++                         void *clientData)           // IN: unused
++{
++   return FALSE;
++}
++
++
++void
++WaylandDrag_Pump(void)
++{
++}
++
++
++void
++WaylandDrag_Disarm(void)
++{
++}
++
++
++void
++WaylandDrag_Cancel(void)
++{
++}
+-- 
+2.55.0
+

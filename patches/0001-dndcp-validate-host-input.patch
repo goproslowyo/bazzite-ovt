@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:09 -0700
+Subject: [PATCH 01/21] dndcp: Validate file lists and file names from the host
+ and drag sources
+
+These helpers take their input from the host RPC channel without
+checking it, and the X11 and GTK3 backends share them. A later patch in
+this series turns on the capability bits that make
+LocalPrepareFileContents() reachable from a Wayland session.
+
+DnDFileList::FromCPClipboard() casts its buffer to a CPFileList and uses
+relPathsLen and fulPathsLen, both uint32 values from the same buffer, as
+lengths to copy. Neither is checked against the number of bytes
+received, and the header is read before the buffer is known to hold one.
+GetRelPathsStr() and GetFullPathsStr() then return the bytes read past
+the end. Check the header length first, then each field against what
+remains, with the second test ordered so that the subtraction cannot
+underflow. AttributesFromCPClipboard() has the same shape and gets the
+same check.
+
+LocalPrepareFileContents() joins a host supplied cpName onto the staging
+directory and then creates, writes and chmods the result. Nothing
+rejects an absolute path or a .. component, so a name can point the
+write outside the staging directory. cpName is opaque<> in the XDR
+definition and so has no terminator, yet it is used as a C string. The
+new LocalIsSafeStagingName() rejects a name that is unterminated, empty,
+absolute, or has a .. component. The name is also published in a
+text/uri-list, where CR and LF each end an entry, so it rejects those
+too.
+
+The same check now runs wherever a host file list is published as paths
+below a staging directory. That is the GTK4 host to guest drag, the GTK3
+one, and a host file paste in the X11 copy and paste backend for GTK3
+and GTK4. A list with an unusable name is refused as a whole. The X11
+copy and paste backends also check the result of FromCPClipboard(),
+which they ignored.
+
+In the GTK4 drag, OnSrcDragBegin() returned without telling the host
+when it could not use the list, which left the drag state machine in
+DRAGBEGIN_PENDING until the host's next drag reset it. It now cancels
+the drag with the host and resets the state machine, for the new check
+and for the two earlier returns.
+
+Four files carry the same RFC 1630 escape table, and none of them
+escapes CR or LF, which dnd/dnd.h defines as the record separators of
+that format in DND_URI_LIST_POST. The four are dndUIX11.cpp,
+dndUIX11GTK4.cpp, copyPasteUIX11.cpp and copyPasteUIX11GTK4.cpp, which
+cover both directions of drag and drop and of copy and paste, for GTK3
+and GTK4. Fix all four, since configure decides which of them is built.
+A name containing CR or LF is published as several entries, and the
+extra entries can name any absolute path, outside the staging directory
+and outside the block. Escape both characters.
+
+The lists that come from guest applications need checks too. A dragged
+or copied URI with no path separator, such as "file:foo", made
+Str_Strrchr() return NULL, and the parsers used NULL + 1 as the relative
+path. All four now skip such an entry. SetCPClipboardFromGtk_File() also
+read totalSize uninitialised. Trimming the GNOME list separator from an
+empty host file list made erase() throw out of the main loop, and the
+trim now checks that the separator is there.
+
+Malformed input makes these functions return failure rather than assert.
+They run on the daemon's main loop, and an assertion failure on one bad
+message would stop the daemon.
+
+Only the GTK4 configuration was compiled. dndUIX11.cpp and
+copyPasteUIX11.cpp are built only for GTK3 and were not.
+---
+ services/plugins/dndcp/copyPasteDnDUtil.cpp   |  70 ++++++++++
+ services/plugins/dndcp/copyPasteUIX11.cpp     |  32 ++++-
+ services/plugins/dndcp/copyPasteUIX11GTK4.cpp |  32 ++++-
+ .../dndcp/dndGuestBase/copyPasteDnDUtil.h     |   3 +
+ .../plugins/dndcp/dndGuestBase/dndFileList.cc |  26 ++++
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |   2 +
+ services/plugins/dndcp/dndUIX11.cpp           |  28 +++-
+ services/plugins/dndcp/dndUIX11GTK4.cpp       | 126 ++++++++++++++++--
+ 8 files changed, 302 insertions(+), 17 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteDnDUtil.cpp b/services/plugins/dndcp/copyPasteDnDUtil.cpp
+index 20601b8..1223c86 100644
+--- a/services/plugins/dndcp/copyPasteDnDUtil.cpp
++++ b/services/plugins/dndcp/copyPasteDnDUtil.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include "copyPasteDnDUtil.h"
+ #include "file.h"
++#include "str.h"
+ #include "dndFileContentsUtil.h"
+ #include "dndFileList.hh"
+ #include "copyPasteUIX11.h"
+@@ -36,6 +37,64 @@ extern "C" {
+ }
+ 
+ 
++/*
++ *----------------------------------------------------------------------------
++ *
++ * LocalIsSafeStagingName --
++ *
++ *      Check that a host supplied file name is NUL terminated and can only
++ *      name something below the staging directory it will be appended to.
++ *
++ *      Every path that joins a host supplied name onto a staging directory
++ *      uses this check, so that they agree on what a staged name may be.
++ *
++ * Results:
++ *      true if the name is safe to use, false otherwise.
++ *
++ * Side effects:
++ *      None.
++ *
++ *----------------------------------------------------------------------------
++ */
++
++bool
++LocalIsSafeStagingName(const char *name,     // IN: host supplied file name
++                       size_t len)           // IN: bytes at name
++{
++   const char *comp = name;
++
++   if (len == 0 || name[len - 1] != '\0') {
++      return false;
++   }
++
++   if (*name == '\0' || File_IsFullPath(name)) {
++      return false;
++   }
++
++   /*
++    * CR and LF each end an entry in a text/uri-list, and this name is put
++    * into one. A name carrying either would be published as several entries,
++    * the extra ones naming whatever the host chose.
++    */
++   if (Str_Strchr(name, '\r') != NULL || Str_Strchr(name, '\n') != NULL) {
++      return false;
++   }
++
++   while (comp != NULL) {
++      if (Str_Strncmp(comp, "..", 2) == 0 &&
++          (comp[2] == '\0' || comp[2] == DIRSEPC)) {
++         return false;
++      }
++      comp = Str_Strchr(comp, DIRSEPC);
++      if (comp != NULL) {
++         comp++;
++      }
++   }
++
++   return true;
++}
++
++
+ /*
+  *----------------------------------------------------------------------------
+  *
+@@ -139,6 +198,17 @@ LocalPrepareFileContents(const CPClipboard *clip,                       // IN
+                              fileItem[i].cpName.cpName_len - 1,
+                              '\0',
+                              DIRSEPC);
++
++      /*
++       * The name is host supplied and is about to be joined onto the staging
++       * directory, so it must not be able to name anything outside of it.
++       */
++      if (!LocalIsSafeStagingName(fileItem[i].cpName.cpName_val,
++                                  fileItem[i].cpName.cpName_len)) {
++         Warning("%s: unsafe fileItem[%" FMTSZ "u].cpName.\n", __FUNCTION__, i);
++         goto exit;
++      }
++
+       fileName = fileItem[i].cpName.cpName_val;
+       filePathName = tempDir;
+       filePathName += DIRSEPS + fileName;
+diff --git a/services/plugins/dndcp/copyPasteUIX11.cpp b/services/plugins/dndcp/copyPasteUIX11.cpp
+index d9c1f23..87aedf0 100644
+--- a/services/plugins/dndcp/copyPasteUIX11.cpp
++++ b/services/plugins/dndcp/copyPasteUIX11.cpp
+@@ -1043,9 +1043,18 @@ CopyPasteUIX11::LocalGetSelectionFileList(const Gtk::SelectionData& sd)      //
+ #endif
+ 
+       /*
+-       * Parse relative path.
++       * Parse relative path. The clipboard owner controls these bytes, and
++       * an entry such as "file:foo" has no path separator. Skip it instead
++       * of pointing past the end of the string.
+        */
+-      newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
++      newRelPath = Str_Strrchr(newPath, DIRSEPC);
++      if (newRelPath == NULL) {
++         g_debug("%s: skipping uri without a path separator '%s'\n",
++                 __FUNCTION__, newPath);
++         free(newPath);
++         continue;
++      }
++      newRelPath++; // Point to char after '/'
+ 
+       /* Keep track of how big the fcp files are. */
+       if ((size = File_GetSizeEx(newPath)) >= 0) {
+@@ -1143,6 +1152,8 @@ CopyPasteUIX11::GetNextPath(utf::utf8string& str, // IN: NUL-delimited path list
+           ubyte == '*' ||   /* "Special significance within specific schemes" */
+           ubyte == '!' ||   /* "Special significance within specific schemes" */
+           ubyte == '%' ||   /* Escape character */
++          ubyte == '\r' ||  /* Ends an entry in a uri-list */
++          ubyte == '\n' ||  /* Ends an entry in a uri-list */
+           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
+          str.replace(index, 1, "%");
+          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);
+@@ -1294,7 +1305,22 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
+    if (CPClipboard_GetItem(clip, CPFORMAT_FILELIST, &buf, &sz)) {
+       g_debug("%s: File data.\n", __FUNCTION__);
+       DnDFileList flist;
+-      flist.FromCPClipboard(buf, sz);
++      if (!flist.FromCPClipboard(buf, sz)) {
++         g_debug("%s: malformed file list\n", __FUNCTION__);
++         return;
++      }
++
++      /*
++       * The names come from the host and are published as paths below the
++       * staging directory. Refuse the list if any of them could leave it.
++       */
++      for (const std::string &rel : flist.GetRelPaths()) {
++         if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
++            g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
++                    rel.c_str());
++            return;
++         }
++      }
+       mTotalFileSize = flist.GetFileSize();
+       mHGFCPData = flist.GetRelPathsStr();
+ 
+diff --git a/services/plugins/dndcp/copyPasteUIX11GTK4.cpp b/services/plugins/dndcp/copyPasteUIX11GTK4.cpp
+index 1ba8db4..2571ebe 100644
+--- a/services/plugins/dndcp/copyPasteUIX11GTK4.cpp
++++ b/services/plugins/dndcp/copyPasteUIX11GTK4.cpp
+@@ -794,9 +794,18 @@ CopyPasteUIX11::CopyPasteSendFile(const Glib::RefPtr<Gio::AsyncResult>& result)
+ #endif
+ 
+       /*
+-       * Parse relative path.
++       * Parse relative path. The clipboard owner controls these bytes, and
++       * an entry such as "file:foo" has no path separator. Skip it instead
++       * of pointing past the end of the string.
+        */
+-      newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
++      newRelPath = Str_Strrchr(newPath, DIRSEPC);
++      if (newRelPath == NULL) {
++         g_debug("%s: skipping uri without a path separator '%s'\n",
++                 __FUNCTION__, newPath);
++         free(newPath);
++         continue;
++      }
++      newRelPath++; // Point to char after '/'
+ 
+       /* Keep track of how big the fcp files are. */
+       if ((size = File_GetSizeEx(newPath)) >= 0) {
+@@ -1236,6 +1245,8 @@ CopyPasteUIX11::GetNextPath(utf::utf8string& str, // IN: NUL-delimited path list
+           ubyte == '*' ||   /* "Special significance within specific schemes" */
+           ubyte == '!' ||   /* "Special significance within specific schemes" */
+           ubyte == '%' ||   /* Escape character */
++          ubyte == '\r' ||  /* Ends an entry in a uri-list */
++          ubyte == '\n' ||  /* Ends an entry in a uri-list */
+           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
+          str.replace(index, 1, "%");
+          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);
+@@ -1449,7 +1460,22 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
+    if (CPClipboard_GetItem(clip, CPFORMAT_FILELIST, &buf, &sz)) {
+       g_debug("%s: File data.\n", __FUNCTION__);
+       DnDFileList flist;
+-      flist.FromCPClipboard(buf, sz);
++      if (!flist.FromCPClipboard(buf, sz)) {
++         g_debug("%s: malformed file list\n", __FUNCTION__);
++         return;
++      }
++
++      /*
++       * The names come from the host and are published as paths below the
++       * staging directory. Refuse the list if any of them could leave it.
++       */
++      for (const std::string &rel : flist.GetRelPaths()) {
++         if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
++            g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
++                    rel.c_str());
++            return;
++         }
++      }
+       mTotalFileSize = flist.GetFileSize();
+       mHGFCPData = flist.GetRelPathsStr();
+       mHGGetListTime = GetCurrentTime();
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDUtil.h b/services/plugins/dndcp/dndGuestBase/copyPasteDnDUtil.h
+index 8a1a34a..5696135 100644
+--- a/services/plugins/dndcp/dndGuestBase/copyPasteDnDUtil.h
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDUtil.h
+@@ -34,4 +34,7 @@
+ bool LocalPrepareFileContents(const CPClipboard *clip,
+                               std::vector<utf::string>& fileContentsList);
+ 
++bool LocalIsSafeStagingName(const char *name,
++                            size_t len);
++
+ #endif
+diff --git a/services/plugins/dndcp/dndGuestBase/dndFileList.cc b/services/plugins/dndcp/dndGuestBase/dndFileList.cc
+index 15b521f..4fd58e4 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndFileList.cc
++++ b/services/plugins/dndcp/dndGuestBase/dndFileList.cc
+@@ -489,6 +489,7 @@ DnDFileList::FromCPClipboard(const void *buf,   // IN: Source buffer
+ {
+    const CPFileList *flist;
+    std::string relPaths;
++   size_t payloadLen;
+ 
+    ASSERT(buf);
+    ASSERT(len);
+@@ -496,7 +497,22 @@ DnDFileList::FromCPClipboard(const void *buf,   // IN: Source buffer
+       return false;
+    }
+ 
++   /*
++    * The header and its length fields come straight off the wire, so nothing
++    * may be dereferenced until they have been checked against len.
++    */
++   if (len < CPFILELIST_HEADER_SIZE) {
++      return false;
++   }
++
+    flist = reinterpret_cast<const CPFileList *>(buf);
++   payloadLen = len - CPFILELIST_HEADER_SIZE;
++
++   if (flist->relPathsLen > payloadLen ||
++       flist->fulPathsLen > payloadLen - flist->relPathsLen) {
++      return false;
++   }
++
+    relPaths.assign(
+       reinterpret_cast<const char *>(flist->filelists), flist->relPathsLen);
+ 
+@@ -542,8 +558,18 @@ DnDFileList::AttributesFromCPClipboard(const void *buf, // IN: Source buffer
+       return false;
+    }
+ 
++   if (len < URI_ATTRIBUTES_LIST_HEADER_SIZE) {
++      return false;
++   }
++
+    alist = reinterpret_cast<const CPAttributeList *>(buf);
+ 
++   /* attributesLen is host supplied, and must fit in the bytes received. */
++   if (alist->attributesLen >
++       (len - URI_ATTRIBUTES_LIST_HEADER_SIZE) / sizeof (CPFileAttributes)) {
++      return false;
++   }
++
+    mAttributeList.resize(alist->attributesLen);
+    for (uint32 i = 0; i < alist->attributesLen; i++) {
+       mAttributeList[i] = alist->attributeList[i];
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index cc95f7b..572e5b9 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -81,6 +81,8 @@ private:
+    BuildFileContentURIList(utf::string& uriList,
+                            utf::string pre,
+                            utf::string post);
++   bool LocalFileListIsSafe(const DnDFileList &fList);
++   void LocalRefuseDrag(void);
+    void LocalGetFileRequest(utf::string stagingDirName, const char *desktop);
+    void LocalGetFileContentsRequest(const char *desktop);
+    void LocalSetContentProvider(const char* desktop);
+diff --git a/services/plugins/dndcp/dndUIX11.cpp b/services/plugins/dndcp/dndUIX11.cpp
+index 602efad..25c682f 100644
+--- a/services/plugins/dndcp/dndUIX11.cpp
++++ b/services/plugins/dndcp/dndUIX11.cpp
+@@ -63,6 +63,7 @@ extern "C" {
+ #endif
+ 
+ #include "copyPasteDnDWrapper.h"
++#include "copyPasteDnDUtil.h"
+ 
+ 
+ /*
+@@ -1078,6 +1079,18 @@ DnDUIX11::OnGtkDragDataGet(
+          return;
+       }
+ 
++      /*
++       * The names come from the host and are published as paths below the
++       * staging directory. Refuse the list if any of them could leave it.
++       */
++      for (const std::string &rel : fList.GetRelPaths()) {
++         if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
++            g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
++                    rel.c_str());
++            return;
++         }
++      }
++
+       mTotalFileSize = fList.GetFileSize();
+ 
+       /* Provide URIs for each path in the guest's file list. */
+@@ -1437,9 +1450,18 @@ DnDUIX11::SetCPClipboardFromGtk(const Gtk::SelectionData& sd) // IN
+          }
+ #endif
+          /*
+-          * Parse relative path.
++          * Parse relative path. The drag source controls these bytes, and an
++          * entry such as "file:foo" has no path separator. Skip it instead
++          * of pointing past the end of the string.
+           */
+-         newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
++         newRelPath = Str_Strrchr(newPath, DIRSEPC);
++         if (newRelPath == NULL) {
++            g_debug("%s: skipping uri without a path separator '%s'\n",
++                    __FUNCTION__, newPath);
++            free(newPath);
++            continue;
++         }
++         newRelPath++; // Point to char after '/'
+ 
+          /* Keep track of how big the dnd files are. */
+          if ((size = File_GetSizeEx(newPath)) >= 0) {
+@@ -1683,6 +1705,8 @@ DnDUIX11::GetNextPath(utf::utf8string& str,     // IN: NUL-delimited path list
+           ubyte == '*' ||   /* "Special significance within specific schemes" */
+           ubyte == '!' ||   /* "Special significance within specific schemes" */
+           ubyte == '%' ||   /* Escape character */
++          ubyte == '\r' ||  /* Ends an entry in a uri-list */
++          ubyte == '\n' ||  /* Ends an entry in a uri-list */
+           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
+          str.replace(index, 1, "%");
+          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index 5ac5c6f..247c7ed 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -489,7 +489,17 @@ DnDUIX11::LocalGetFileRequest(utf::string stagingDirName,
+       /* Setting Gnome URIs for each path in the guest's file list. */
+       BuildFileURIList(mHGDndUriList, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST, stagingDirName);
+       /* Nautilus on Gnome does not expect FCP_GNOME_LIST_POST after the last uri. See bug 143147. */
+-      mHGDndUriList.erase(mHGDndUriList.size() - strlen(FCP_GNOME_LIST_POST));
++      size_t postLen = strlen(FCP_GNOME_LIST_POST);
++      if (mHGDndUriList.length() >= postLen &&
++          mHGDndUriList.compare(mHGDndUriList.length() - postLen,
++                                postLen,
++                                FCP_GNOME_LIST_POST) == 0) {
++         /*
++          * The list is empty when there are no files, and an unguarded
++          * subtraction would wrap and make erase() throw out of the main loop.
++          */
++         mHGDndUriList.erase(mHGDndUriList.length() - postLen);
++      }
+       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGDndUriList.c_str());
+    } else if (desktop && strstr(desktop, "KDE")) {
+       /* Setting KDE URIs for each path in the guest's file list. */
+@@ -526,7 +536,17 @@ DnDUIX11::LocalGetFileContentsRequest(const char *desktop)
+       /* Setting Gnome URIs for each path in the guest's file list. */
+       BuildFileContentURIList(mHGDndUriList, FCP_GNOME_LIST_PRE, FCP_GNOME_LIST_POST);
+       /* Nautilus on Gnome does not expect FCP_GNOME_LIST_POST after the last uri. See bug 143147. */
+-      mHGDndUriList.erase(mHGDndUriList.size() - strlen(FCP_GNOME_LIST_POST));
++      size_t postLen = strlen(FCP_GNOME_LIST_POST);
++      if (mHGDndUriList.length() >= postLen &&
++          mHGDndUriList.compare(mHGDndUriList.length() - postLen,
++                                postLen,
++                                FCP_GNOME_LIST_POST) == 0) {
++         /*
++          * The list is empty when there are no files, and an unguarded
++          * subtraction would wrap and make erase() throw out of the main loop.
++          */
++         mHGDndUriList.erase(mHGDndUriList.length() - postLen);
++      }
+       g_debug("%s: providing file list [%s]\n", __FUNCTION__, mHGDndUriList.c_str());
+    } else if (desktop && strstr(desktop, "KDE")) {
+       /* Setting KDE URIs for each path in the guest's file list. */
+@@ -541,6 +561,71 @@ DnDUIX11::LocalGetFileContentsRequest(const char *desktop)
+ /* Source functions for HG DnD. */
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalFileListIsSafe --
++ *
++ *      Whether every relative path in a host file list names something below
++ *      the staging directory and can be published as one uri-list entry.
++ *
++ * Results:
++ *      True if all of them can, false at the first that cannot.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DnDUIX11::LocalFileListIsSafe(const DnDFileList &fList)   // IN
++{
++   std::vector<std::string> relPaths = fList.GetRelPaths();
++
++   for (const std::string &rel : relPaths) {
++      if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
++         g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
++                 rel.c_str());
++         return false;
++      }
++   }
++
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalRefuseDrag --
++ *
++ *      Abandon a host to guest drag that has just begun.
++ *
++ *      Returning from OnSrcDragBegin() without SourceDragStartDone() leaves
++ *      the state machine in DRAGBEGIN_PENDING, and the host's next drag then
++ *      only resets it. Resetting here runs OnSrcCancel() over the state the
++ *      drag begin set up, and leaves the state machine ready.
++ *
++ * Side effects:
++ *      Clears the clipboard copy and the file list, and resets mDnD.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalRefuseDrag(void)
++{
++   mHGFCPData.clear();
++   mHGDndUriList = "";
++   CPClipboard_Clear(&mClipboard);
++   mDnD->GetRpc()->SrcCancel(mDnD->GetSessionId());
++   /*
++    * This deletes the GuestDnDSrc whose signal called this function. The
++    * GuestDnDSrc touches none of its members after the signal returns, so
++    * the delete is safe.
++    */
++   mDnD->ResetDnD();
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -594,11 +679,26 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+       if (stagingDirName.length() == 0) {
+          g_debug("%s: Cannot get staging directory name, stagingDir: %s\n",
+                  __FUNCTION__, mHGStagingDir.c_str());
++         LocalRefuseDrag();
+          return;
+       }
+ 
+       if (!fList.FromCPClipboard(buf, sz)) {
+          g_debug("%s: Can't get data from clipboard\n", __FUNCTION__);
++         LocalRefuseDrag();
++         return;
++      }
++
++      /*
++       * Every name below goes into the uri-list with only percent escaping,
++       * and resolves under the vmblock mount. A name that leads out of the
++       * staging directory, or ends a uri-list entry early, publishes a path
++       * where nothing was staged.
++       */
++      if (!LocalFileListIsSafe(fList)) {
++         g_warning("%s: refusing a file list with an unusable name\n",
++                   __FUNCTION__);
++         LocalRefuseDrag();
+          return;
+       }
+       mTotalFileSize = fList.GetFileSize();
+@@ -1373,7 +1473,7 @@ bool DnDUIX11::SetCPClipboardFromGtk_File(utf::string &source)
+    size_t index = 0;
+    char *newPath;
+    size_t newPathLen;
+-   uint64 totalSize;
++   uint64 totalSize = 0;
+    int64 size;
+ 
+    g_debug("%s: Got file list: [%s]\n", __FUNCTION__, source.c_str());
+@@ -1424,9 +1524,19 @@ bool DnDUIX11::SetCPClipboardFromGtk_File(utf::string &source)
+       }
+ #endif
+       /*
+-       * Parse relative path.
++       * Parse relative path. The drag source controls these bytes. An entry
++       * with no path separator, such as the bare "file:foo" form, or with
++       * nothing after the last separator has no relative part. Skip it
++       * instead of pointing past the end of the string.
+        */
+-      newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1; // Point to char after '/'
++      newRelPath = Str_Strrchr(newPath, DIRSEPC);
++      if (newRelPath == NULL || newRelPath[1] == '\0') {
++         g_debug("%s: skipping uri without a relative path '%s'\n",
++                 __FUNCTION__, newPath);
++         free(newPath);
++         continue;
++      }
++      newRelPath++; // Point to char after '/'
+ 
+       /* Keep track of how big the dnd files are. */
+       if ((size = File_GetSizeEx(newPath)) >= 0) {
+@@ -1554,10 +1664,6 @@ bool DnDUIX11::SetCPClipboardFromGtk_RTF(utf::string &source)
+ bool
+ DnDUIX11::SetCPClipboardFromGtk(std::string &data, std::string &drop_type) // IN
+ {
+-   DnDFileList fileList;
+-   DynBuf buf;
+-   uint64 totalSize = 0;
+-   int64 size;
+    bool ret = false;
+ 
+    utf::string source = utf::string(data);
+@@ -1674,6 +1780,8 @@ DnDUIX11::GetNextPath(utf::utf8string& str,     // IN: NUL-delimited path list
+           ubyte == '*' ||   /* "Special significance within specific schemes" */
+           ubyte == '!' ||   /* "Special significance within specific schemes" */
+           ubyte == '%' ||   /* Escape character */
++          ubyte == '\r' ||  /* Ends an entry in a uri-list */
++          ubyte == '\n' ||  /* Ends an entry in a uri-list */
+           ubyte >= 0x80) {  /* UTF-8 encoding bytes */
+          str.replace(index, 1, "%");
+          str.insert(index + 1, 1, Dec2Hex[ubyte >> 4]);
+-- 
+2.55.0
+

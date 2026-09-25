@@ -1,0 +1,1224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:10 -0700
+Subject: [PATCH 13/21] dndcp: Drag and drop over Xwayland in a Wayland session
+
+The Wayland backend leaves drag and drop to DnDUIX11. Under a Wayland
+session its detection window is an Xwayland client, and the compositor
+bridges its XDND to native clients. Several things kept that from
+working.
+
+The detection window was override-redirect. A compositor that bridges a
+native Wayland drag to an Xwayland window looks for the target among
+managed clients, so it never offers the drag to an unmanaged window, and
+no XdndEnter arrives. On KWin the lookup is Workspace::findClient(),
+called from XwlDropHandler::updateDragTarget(). Keep the window managed,
+and keep it from taking focus with _NET_WM_WINDOW_TYPE_DND,
+_NET_WM_USER_TIME 0 and WM_HINTS input False. Skip taskbar and skip
+pager keep it out of the panels.
+
+This is not specific to KWin. On sway 1.11 a native Wayland drag
+offering text/uri-list reaches an XdndAware Xwayland window and
+completes the handshake. The same window created override-redirect is
+offered nothing, and the drag begins and ends without a single
+XdndEnter.
+
+A window does not become a drag target the moment it maps. The
+compositor has to adopt it and it has to paint, and both happen about
+100 ms after MapNotify. The compositor picks the target on pointer
+motion and does not look again, and the only motion in this sequence is
+the move right after the map. Wait up to 500 ms for the window to appear
+in _NET_CLIENT_LIST first. The old code slept 300 microseconds.
+
+The wait polls without running the main loop. It runs from an RPC
+handler, and GuestDnDMgr::OnRpcQueryExiting() shows the detection window
+before it records the session id. A command dispatched from inside the
+wait would run that sequence again, and the outer call would then write
+the older session id last. The host's later commands for the real
+session would all be rejected, and drag and drop would stay broken until
+something reset it. Polling is enough, because the window manager acts
+on X requests that have already been flushed.
+
+The detection window is shown twice in a host to guest drop, once to be
+positioned and once to start the drag, and only the first may move the
+pointer. Moving it again after the drag has started takes the drag off
+the target the host chose, just before the button is released. The drag
+then ends in GDK_DRAG_CANCEL_NO_TARGET, and the file reaches the staging
+directory but not the application it was dropped on. The caller passes
+the window's role explicitly rather than inferring it from drag state.
+
+A window manager may place and size a window as it likes. The window was
+mapped at the size of the monitor and resized right after, and a
+compositor only has to honour the size a window is mapped with. One that
+ignores the later resize leaves a detection window over the whole
+output, which takes the drop meant for the window underneath. Map it at
+the size it is used at, set a size request, which GTK applies on every
+map, and give it fixed size hints. sway floats a window with fixed size
+hints instead of tiling it. The WM_NORMAL_HINTS also carry the requested
+position, and the window is placed before it is mapped, because GNOME
+put it somewhere of its own on the first map after vmusr started.
+
+The press that starts a host to guest drag is aimed at the position the
+window has, not the one it was asked to take. GTK starts a drag from a
+press and motion on the widget itself, so a press anywhere else starts
+nothing. After the press the pointer goes back to where the host has it,
+rather than waiting for the host's next motion. Otherwise the target
+receives XdndEnter after the button has been released, and the drag ends
+in XdndLeave instead of a drop.
+
+Warp the X pointer after a uinput move. uinput moves the compositor's
+pointer, and under Xwayland an X client learns the real position only
+while the pointer is over one of its own surfaces. Without the warp,
+XDND picks its target from a stale position.
+
+vmware-user-suid-wrapper opened uinput for the plugin only when
+XDG_SESSION_TYPE says Wayland. It now also does so when WAYLAND_DISPLAY
+is set outside an X11 session, the rule the plugin uses to choose its
+backend, so that sway started from a text console gets the uinput
+pointer.
+
+With drag and drop in place the backend reports the same capabilities as
+the X11 one, DND_CP_CAP_FORMATS_ALL, and hands DnDUIX11 the vmblock
+control it uses for copy and paste. Without an X display
+DnDUIX11::Init() fails, drag and drop stays off, and DND_CP_CAP_DND is
+left out.
+
+dragDetWndX11GTK4.cpp is shared with the X11 backend. In an Xorg session
+the detection window keeps upstream's focus handling. It is focusable,
+Show() gives it the focus and Raise() calls present(), because Mutter
+and the window managers derived from it stack a newly mapped window that
+they do not activate below the active one. It gets none of the focus
+hints, and there is no wait for the window manager, since an X11 drag
+source finds the window in the X server. The size and position hints
+apply to both kinds of session.
+
+Tested on Bazzite 44 (Fedora 44) with KDE Plasma 6.7.5 on Wayland,
+against VMware Workstation Pro 26H1u1, build 26.0.1.25688693, on Windows
+10 Pro 22H2. A 16 MB zip dragged from Dolphin lands on the host, and the
+handshake completes in about 110 ms. On GNOME 50.3 (Bluefin 44), a guest
+to host drag of text reached Firefox on the host. An Xorg session has
+not been tested on a VM.
+---
+ .../plugins/dndcp/copyPasteDnDWayland.cpp     |  16 +-
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |  10 +
+ .../dndcp/dndGuestBase/dragDetWndX11GTK4.h    |  16 +-
+ services/plugins/dndcp/dndUIX11GTK4.cpp       | 132 +++-
+ services/plugins/dndcp/dragDetWndX11GTK4.cpp  | 634 +++++++++++++++++-
+ vmware-user-suid-wrapper/main.c               |   9 +
+ 6 files changed, 752 insertions(+), 65 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+index 4586367..cc492e5 100644
+--- a/services/plugins/dndcp/copyPasteDnDWayland.cpp
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+@@ -281,6 +281,12 @@ CopyPasteDnDWayland::RegisterDnD()
+    if (!wrapper->IsDnDRegistered()) {
+       m_dndUI = new DnDUIX11(wrapper->GetToolsAppCtx());
+       if (m_dndUI != NULL) {
++         /*
++          * The same block control the file paste path uses. Drag and drop
++          * stages host files through vmblock the same way copy and paste
++          * does.
++          */
++         m_dndUI->SetBlockControl(&m_blockCtrl);
+          if (m_dndUI->Init()) {
+             wrapper->SetDnDIsRegistered(TRUE);
+             m_dndUI->SetDnDAllowed(TRUE);
+@@ -418,11 +424,12 @@ CopyPasteDnDWayland::SetDnDAllowed(bool allowed)
+  *
+  * CopyPasteDnDWayland::GetCaps --
+  *
+- *    Report what this backend supports, which is copy and paste of every
+- *    format the X11 backend handles.
++ *    Report what this backend supports, which is the same set the X11
++ *    backend reports, less drag and drop when GTK could not open a display.
+  *
+  *    Copy and paste owns the Wayland selection directly, so one selection can
+- *    carry rich text and its plain rendering at once.
++ *    carry rich text and its plain rendering at once. Drag and drop is
++ *    delegated to DnDUIX11, which handles every format.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -431,8 +438,9 @@ uint32
+ CopyPasteDnDWayland::GetCaps()
+ {
+    return DND_CP_CAP_VALID |
++          (m_haveGtk ? DND_CP_CAP_DND : 0) |
+           DND_CP_CAP_CP |
+-          DND_CP_CAP_FORMATS_CP |
++          DND_CP_CAP_FORMATS_ALL |
+           DND_CP_CAP_ACTIVE_CP |
+           DND_CP_CAP_BIG_BUFFER;
+ }
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index 384bcb8..c60c54e 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -120,9 +120,19 @@ private:
+     */
+    void OnGetFilesDone(bool success);
+ 
++   /*
++    * The role the detection window plays while it is shown. A drag has to
++    * find a drop target, but nothing has to find a drag source.
++    */
++   typedef enum {
++      DET_WND_DROP_TARGET,
++      DET_WND_DRAG_SOURCE
++   } DetWndRole;
++
+    /*
+     * Callbacks for showing/hiding detection window.
+     */
++   void ShowDetWnd(bool bShow, int32 x, int32 y, DetWndRole role);
+    void OnUpdateDetWnd(bool bShow, int32 x, int32 y);
+    void OnDestMoveDetWndToMousePos();
+    void SourceDragStartDone();
+diff --git a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+index e76787e..9453f34 100644
+--- a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+@@ -70,11 +70,13 @@ public:
+    bool register_target_value_handler(target_drag_value_handler handler, void *ctx);
+    bool EnableDND(void);
+    bool DisableDND(void);
+-   void UpdateDetWnd(bool Show, int32 x, int32 y);
++   void UpdateDetWnd(bool Show, int32 x, int32 y, bool asDropTarget = false);
+    bool SimulateXEvents(const bool showWidget, const bool buttonEvent,
+                         const bool buttonPress, const bool moveWindow,
+                         const bool coordsProvided,
+                         const int xCoord, const int yCoord);
++   /* Where the compositor put the window, which may not be where asked. */
++   void GetGeometry(int &x, int &y, int &width, int &height);
+    void RefreshScreenSize(void);
+    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
+                   int mouseX,
+@@ -91,13 +93,17 @@ private:
+    void Show();
+    void Hide();
+    void Raise();
++   void ApplyDetWndMode();
++   bool WaitUntilManaged(unsigned int timeoutMs);
++   void RequestSkipTaskbar();
++   bool GetXWindow(Display **display, Window *xwindow);
++   void SendWmState(long action, Atom first, Atom second, long source);
+    void Lower();
+    void Flush();
+    int GetScreenWidth();
+    int GetScreenHeight();
+    void SetGeometry(const int x, const int y,
+                     const int width, const int height);
+-   void GetGeometry(int &x, int &y, int &width, int &height);
+    void SetIsVisible(const bool isVisible) {m_isVisible = isVisible;};
+    bool GetIsVisible() {return m_isVisible;};
+    bool SimulateMouseMove(const int x, const int y);
+@@ -107,6 +113,12 @@ private:
+    Glib::RefPtr< Gtk::DragSource > mSource;
+    Glib::RefPtr< Gtk::DropTarget > mTarget;
+    bool mUseUInput;
++   /* The X server is Xwayland, under a Wayland compositor. */
++   bool mUnderWayland;
++   /* Where SetGeometry() last asked for the window, for the WM_NORMAL_HINTS. */
++   bool mPlaced;
++   int mPlacedX;
++   int mPlacedY;
+    int mScreenWidth;
+    int mScreenHeight;
+ };
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index 20e788d..d7af0fd 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -92,16 +92,21 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
+ {
+    TRACE_CALL();
+ 
+-
+    /*
+     * XXX Hard coded use of default screen means this doesn't work in dual-
+     * headed setups (e.g. DISPLAY=:0.1).  However, the number of people running
+     * such setups in VMs is expected to be, like, hella small, so I'mma cut
+     * corners for now.
++    *
++    * There is no display when DISPLAY is unset. Init() then fails, and drag
++    * and drop stays off.
+     */
+    Glib::RefPtr<Gdk::Display> display = Gdk::Display::get_default();
+-   GdkSurface *gdkSurface = gdk_x11_display_get_default_group(display->gobj());
+-   mGdkSurface = Glib::wrap(gdkSurface);
++   if (display && GDK_IS_X11_DISPLAY(display->gobj())) {
++      GdkSurface *gdkSurface =
++         gdk_x11_display_get_default_group(display->gobj());
++      mGdkSurface = Glib::wrap(gdkSurface);
++   }
+    UpdateWorkArea();
+ }
+ 
+@@ -164,6 +169,12 @@ DnDUIX11::Init()
+ 
+    CPClipboard_Init(&mClipboard);
+ 
++   /* The detection window is an X11 window. */
++   if (!mGdkSurface) {
++      g_warning("%s: no X display, drag and drop is off\n", __FUNCTION__);
++      return false;
++   }
++
+    GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
+    ASSERT(p);
+    mDnD = p->GetDnDMgr();
+@@ -681,7 +692,7 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+    mDetWnd->RefreshScreenSize();
+ 
+    /* Move detect window to the mouse in position */
+-   OnUpdateDetWnd(true, mOriginX, mOriginY);
++   ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
+ 
+    TRACE_CALL();
+ 
+@@ -805,12 +816,41 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+           * otherwise it may be another DnD, not ours. Send a release, then
+           * a press here to cover this case.
+           */
+-         mDetWnd->SimulateXEvents(true, true, false, true, true, x, y);
++         int detX = 0, detY = 0, detW = 0, detH = 0;
++         int pressX = x, pressY = y;
++
++         /*
++          * GTK starts the drag from a press followed by motion on the
++          * detection window itself, so the press has to land on it. A
++          * compositor may put the window somewhere other than the requested
++          * position, and a tiling one does, so press where the window is.
++          */
++         mDetWnd->GetGeometry(detX, detY, detW, detH);
++         if (detW > 0 && detH > 0) {
++            pressX = detX + detW / 2;
++            pressY = detY + detH / 2;
++            if (pressX != x || pressY != y) {
++               g_debug("%s: pressing on the detection window at (%d, %d), "
++                       "not the pointer at (%d, %d)\n", __FUNCTION__,
++                       pressX, pressY, x, y);
++            }
++         }
++         mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
+          // simulate drag mouse press
+-         mDetWnd->SimulateXEvents(false, true, true, false, true, x, y);
++         mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
+          mHGButtonDown = true;
+          // Tell Gtk that a drag should be started from this widget.
+-         mDetWnd->StartDrag(mProvider, x, y);
++         mDetWnd->StartDrag(mProvider, pressX, pressY);
++
++         /*
++          * Put the pointer back where the host has it. The press had to
++          * land on the detection window, but the drag follows the pointer
++          * from here. Waiting for the next motion from the host leaves the
++          * XDND handshake less time than it needs before the host drops.
++          */
++         if (pressX != x || pressY != y) {
++            mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
++         }
+          mHGDragStarted = true;
+       }
+       if (mEffect != DROP_MOVE) {
+@@ -848,11 +888,11 @@ DnDUIX11::OnSrcCancel()
+     * flybacks when we cancel as user moves mouse in and out of destination
+     * window in a H->G DnD.
+     */
+-   OnUpdateDetWnd(true, mOriginX, mOriginY);
++   ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
+    mDetWnd->SimulateXEvents(true, true, false, true, true,
+                             mOriginX + DRAG_DET_WINDOW_WIDTH / 2,
+                             mOriginY + DRAG_DET_WINDOW_WIDTH / 2);
+-   OnUpdateDetWnd(false, 0, 0);
++   ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
+    mDetWnd->SimulateXEvents(false, false, false, false, true,
+                            mMousePosX, mMousePosY);
+    /* The real release has been sent; ResetUI() need not send another. */
+@@ -961,16 +1001,16 @@ void
+ DnDUIX11::OnSrcDrop()
+ {
+    TRACE_CALL();
+-   OnUpdateDetWnd(true, mOriginX, mOriginY);
++   ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
+ 
+    /*
+     * Move the mouse to the saved coordinates, and release the mouse button.
+     */
+    mDetWnd->SimulateXEvents(false, true, false, false, true,
+                             mMousePosX, mMousePosY);
+-   OnUpdateDetWnd(false, 0, 0);
+    /* The real release has been sent; ResetUI() need not send another. */
+    mHGButtonDown = false;
++   ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
+    /* We've successful or failure for HG drag, set the flag to false anyway */
+    mInHGDrag = false;
+ }
+@@ -1012,12 +1052,59 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::ShowDetWnd --
++ *
++ *      Show or hide the drag detection window in the given role.
++ *
++ * Results:
++ *      Shows/hides and moves detection window.
++ *
++ * Side effects:
++ *      None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
++                     int32 x,        // IN: detection window's destination x-coord
++                     int32 y,        // IN: detection window's destination y-coord
++                     DetWndRole role)// IN: what the window is being shown for
++{
++   g_debug("%s: enter 0x%lx show %d x %d y %d role %d\n",
++           __FUNCTION__,
++           mDetWnd->Get_Current_Drop_ctx(), show, x, y, role);
++
++   /* If the window is being shown, move it to the right place. */
++   if (show) {
++      UpdateWorkArea();
++      x = MAX(x - DRAG_DET_WINDOW_WIDTH / 2, mOriginX);
++      y = MAX(y - DRAG_DET_WINDOW_WIDTH / 2, mOriginY);
++      /*
++       * During a host to guest drag the detection window is the drag source,
++       * and nothing needs to find it, so skip the wait for the window
++       * manager. The caller passes the role because mInHGDrag is not set yet
++       * when that drag begins.
++       */
++      mDetWnd->UpdateDetWnd(show, x, y, role == DET_WND_DROP_TARGET);
++   } else {
++      g_debug("%s: hide\n", __FUNCTION__);
++      mDetWnd->UpdateDetWnd(show, x, y);
++   }
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+  * DnDUIX11::OnUpdateDetWnd --
+  *
+- *      Callback to show/hide drag detection window.
++ *      Callback to show/hide drag detection window. This is only wired to the
++ *      common layer's updateDetWndChanged signal, which the host drives on the
++ *      guest to host path, so the window is always a drop target here.
+  *
+  * Results:
+  *      Shows/hides and moves detection window.
+@@ -1033,20 +1120,7 @@ DnDUIX11::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
+                          int32 x,       // IN: detection window's destination x-coord
+                          int32 y)       // IN: detection window's destination y-coord
+ {
+-   g_debug("%s: enter 0x%lx show %d x %d y %d\n",
+-           __FUNCTION__,
+-           mDetWnd->Get_Current_Drop_ctx(), show, x, y);
+-
+-   /* If the window is being shown, move it to the right place. */
+-   if (show) {
+-      UpdateWorkArea();
+-      x = MAX(x - DRAG_DET_WINDOW_WIDTH / 2, mOriginX);
+-      y = MAX(y - DRAG_DET_WINDOW_WIDTH / 2, mOriginY);
+-      mDetWnd->UpdateDetWnd(show, x, y);
+-   } else {
+-      g_debug("%s: hide\n", __FUNCTION__);
+-      mDetWnd->UpdateDetWnd(show, x, y);
+-   }
++   ShowDetWnd(show, x, y, DET_WND_DROP_TARGET);
+ }
+ 
+ 
+@@ -1635,6 +1709,7 @@ DnDUIX11::OnGHDropRead(const char *data,   // IN
+ bool
+ DnDUIX11::OnGtkDragAccept(const Glib::RefPtr< Gdk::Drop > &drop, void *ctx)
+ {
++   g_debug("%s: XDND accept reached the detection window\n", __FUNCTION__);
+    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
+    if (!this_instance->mDnD->IsDnDAllowed()) {
+       g_warning("%s: No dnd allowed!\n", __FUNCTION__);
+@@ -1703,6 +1778,8 @@ DnDUIX11::OnGtkDragEnter(double x, // IN: drag motion x-coord
+    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
+    Gdk::DragAction action;
+ 
++   g_debug("%s: XDND enter at (%f, %f)\n", __FUNCTION__, x, y);
++
+    if (this_instance->mDetWnd->Is_Current_Drop_Supported()) {
+       action = Gdk::DragAction::COPY;
+    } else {
+@@ -2424,7 +2501,8 @@ DnDUIX11::UpdateWorkArea()
+    TRACE_CALL();
+ 
+    std::vector<unsigned long> values;
+-   if (xutils::GetCardinalList(mGdkSurface, "_NET_WORKAREA", values)
++   if (   mGdkSurface
++       && xutils::GetCardinalList(mGdkSurface, "_NET_WORKAREA", values)
+        && values.size() > 0
+        && values.size() % 4 == 0) {
+       /*
+diff --git a/services/plugins/dndcp/dragDetWndX11GTK4.cpp b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+index 06f0121..1b2fa2a 100644
+--- a/services/plugins/dndcp/dragDetWndX11GTK4.cpp
++++ b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+@@ -35,6 +35,43 @@ extern "C" {
+ #include <gtk/gtk.h>
+ #include <gdk/x11/gdkx.h>
+ #include <X11/Xatom.h>
++#include <stdlib.h>
++#include <string.h>
++}
++
++/* How long UpdateDetWnd() waits for the window manager to adopt the window. */
++#define DET_WND_MANAGE_TIMEOUT_MS 500
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DetWndUnderWayland --
++ *
++ *    Whether this session runs under a Wayland compositor, with Xwayland as
++ *    the X server.
++ *
++ * Results:
++ *    True for a Wayland session, false for an Xorg session.
++ *
++ * Side effects:
++ *    None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++DetWndUnderWayland(void)
++{
++   const char *type = getenv("XDG_SESSION_TYPE");
++   const char *display = getenv("WAYLAND_DISPLAY");
++
++   if (type != NULL && strstr(type, "wayland") != NULL) {
++      return true;
++   }
++   /* The same rule as the backend choice in copyPasteDnDWrapper.cpp. */
++   return display != NULL && *display != '\0' &&
++          (type == NULL || strcmp(type, "x11") != 0);
+ }
+ 
+ 
+@@ -49,6 +86,10 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
+      mSource(NULL),
+      mTarget(NULL),
+      mUseUInput(false),
++     mUnderWayland(DetWndUnderWayland()),
++     mPlaced(false),
++     mPlacedX(0),
++     mPlacedY(0),
+      mScreenWidth(0),
+      mScreenHeight(0)
+ {
+@@ -59,16 +100,35 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
+       return;
+    }
+ 
+-   // Makes this window can grab focus.
++   /*
++    * Under Wayland the detection window must never be activated. GTK4 cannot
++    * tell the window manager that a toplevel takes no focus, so
++    * ApplyDetWndMode() sets the hints for that on the X11 window below.
++    *
++    * KWin activates a focusable detection window on present(). The window
++    * then gets a task switcher entry, takes focus from the application being
++    * dragged from, and takes input until UNGRAB_TIMEOUT expires.
++    *
++    * Under Xorg the window takes focus when it is shown. Mutter and the
++    * window managers derived from it stack a newly mapped window that they
++    * do not activate below the active one, where neither the faked press nor
++    * the XDND drag reaches it.
++    */
+    mWnd->set_decorated(false);
+    mWnd->set_resizable(false);
+    mWnd->set_modal(false);
+-   mWnd->set_can_focus(true);
+-   mWnd->set_focusable(true);
++   mWnd->set_can_focus(!mUnderWayland);
++   mWnd->set_focusable(!mUnderWayland);
+    mWnd->set_sensitive(false);
+    // Makes this window transparent because we don't want user to see it.
+    mWnd->set_opacity(0.01);
+    mWnd->set_visible(true);
++   /*
++    * The X window exists only once GTK has shown the window, and the window
++    * manager reads the hints when the window is mapped. Apply them during
++    * this first map so that the next map picks them up.
++    */
++   ApplyDetWndMode();
+    mWnd->set_visible(false);
+ 
+    //dnd Source controller
+@@ -527,39 +587,52 @@ void
+ DragDetWnd::Show(void)
+ {
+    Glib::RefPtr<Gdk::Display> display = Gdk::Display::get_default();
+-   int width = 0;
+-   int height = 0;
+    g_debug("%s: enter\n", __FUNCTION__);
+-   if (display) {
+-      Glib::RefPtr<Gio::ListModel> monitors = display->get_monitors();
+-      if (!monitors || monitors->get_n_items() == 0)
+-         return;
+-
+-      GListModel* c_model = monitors->gobj();
+-      for (guint i = 0; i < monitors->get_n_items(); ++i) {
+-         GObject* c_item = G_OBJECT(g_list_model_get_item(c_model, i));
+-         Glib::RefPtr<Gdk::Monitor> monitor = Glib::wrap(GDK_MONITOR(c_item), true);
+-         Gdk::Rectangle geometry = monitor->property_geometry();
+-         mWnd->set_default_size(geometry.get_width(), geometry.get_height());
+-         break;
+-      }
+-   } else {
+-          g_error("%s: Cannot get default display \n", __FUNCTION__);
+-          return;
++   if (!display) {
++      g_error("%s: Cannot get default display \n", __FUNCTION__);
++      return;
+    }
+ 
++   /*
++    * Map the window at the size it is used at. UpdateDetWnd() resizes it to
++    * this straight afterwards, but a compositor only has to honour the size
++    * a window is mapped with. A compositor that ignores the later resize
++    * leaves the detection window covering the whole output, on top of the
++    * drop target, and the detection window then takes the drop meant for the
++    * window underneath.
++    */
++   mWnd->set_default_size(DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
++   /*
++    * set_default_size() applies only the first time the window is mapped,
++    * and this window is mapped once and then hidden and shown for each drag.
++    * GTK applies a size request on every map, so a compositor that sizes the
++    * window itself gets the same size each time.
++    */
++   mWnd->set_size_request(DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
++
+    mWnd->set_sensitive(true);
+    mWnd->set_visible(true);
+ 
+-   if (mWnd->grab_focus()) {
+-      g_debug("%s: grab_focus successfully\n", __FUNCTION__);
+-   } else {
+-      Warning("%s: grab_focus failed! May unable to detect drag actions\n", __FUNCTION__);
++   /*
++    * Apply the hints again on every show. GTK may have recreated the X
++    * window, and the hints must be in place before the drag arrives.
++    */
++   ApplyDetWndMode();
++
++   /*
++    * Under Wayland the window must not take focus. Detection works through
++    * the pointer grab and XDND, not keyboard focus.
++    */
++   if (!mUnderWayland) {
++      if (mWnd->grab_focus()) {
++         g_debug("%s: grab_focus successfully\n", __FUNCTION__);
++      } else {
++         Warning("%s: grab_focus failed! May unable to detect drag actions\n",
++                 __FUNCTION__);
++      }
+    }
+ 
+    m_isVisible = true;
+-   // Add a delay to let dnd warming up
+-   usleep(300);
+ 
+    if (mWnd->get_focus())
+    {
+@@ -638,12 +711,448 @@ static Glib::RefPtr<Gdk::Monitor> get_monitor(Gtk::Window *window)
+ void
+ DragDetWnd::Raise(void)
+ {
+-   mWnd->present();
+-   g_debug("%s: detwnd Presenting\n", __FUNCTION__);
++   Display *display;
++   Window xwindow;
++
++   /*
++    * Under Xorg, activate the window as well, so that the window manager
++    * stacks it on top.
++    */
++   if (!mUnderWayland) {
++      mWnd->present();
++      g_debug("%s: detwnd Presenting\n", __FUNCTION__);
++      Flush();
++      return;
++   }
++
++   /*
++    * Under Wayland, present() asks the window manager to activate the
++    * window, which must not happen here. Raise the X11 window directly
++    * instead, since only the stacking order matters.
++    */
++   if (GetXWindow(&display, &xwindow)) {
++      XWindowChanges changes;
++
++      /*
++       * For a managed window XRaiseWindow() alone is only a request, and the
++       * window manager can restack the detection window under the drag source
++       * during the drag. Set the stacking mode explicitly as well.
++       */
++      changes.stack_mode = Above;
++      XConfigureWindow(display, xwindow, CWStackMode, &changes);
++      XRaiseWindow(display, xwindow);
++      XFlush(display);
++      g_debug("%s: detwnd 0x%lx raised\n", __FUNCTION__,
++              (unsigned long) xwindow);
++   }
+    Flush();
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DetWndIsManaged --
++ *
++ *    Check whether the window manager lists this window in _NET_CLIENT_LIST.
++ *    A compositor looks for a drag target among managed windows only, so a
++ *    drag can reach only a managed detection window.
++ *
++ * Results:
++ *    True if the window manager has adopted the window.
++ *
++ * Side effects:
++ *    None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static Bool
++DetWndIsManaged(Display *display,  // IN
++                Window xwindow)    // IN
++{
++   Atom clientList = XInternAtom(display, "_NET_CLIENT_LIST", False);
++   Bool found = False;
++   long offset = 0;
++
++   /*
++    * A busy desktop can have more clients than one request returns, and a
++    * truncated read would report a managed window as unmanaged. Keep reading
++    * while bytesAfter says there is more.
++    */
++   do {
++      Atom actualType;
++      int actualFormat;
++      unsigned long n, bytesAfter;
++      unsigned char *data = NULL;
++
++      if (XGetWindowProperty(display, DefaultRootWindow(display), clientList,
++                             offset, 256, False, XA_WINDOW, &actualType,
++                             &actualFormat, &n, &bytesAfter,
++                             &data) != Success) {
++         return False;
++      }
++      if (data == NULL) {
++         return False;
++      }
++      if (actualType != XA_WINDOW || actualFormat != 32) {
++         XFree(data);
++         return False;
++      }
++
++      Window *list = (Window *) data;
++      for (unsigned long i = 0; i < n && !found; i++) {
++         found = (list[i] == xwindow);
++      }
++      XFree(data);
++
++      if (found || bytesAfter == 0) {
++         break;
++      }
++      offset += (long) n;
++   } while (TRUE);
++
++   return found;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::WaitUntilManaged --
++ *
++ *    Wait for the window manager to adopt the detection window.
++ *
++ *    A window does not become a drag target the moment it maps. KWin needs it
++ *    to be a managed client and to have committed a buffer, and both happen
++ *    around 100ms after MapNotify. This polls _NET_CLIENT_LIST every 10ms,
++ *    and then waits 40ms more for the buffer, whose commit cannot be seen
++ *    from here.
++ *
++ *    KWin picks the target on pointer motion and does not look again until
++ *    the pointer moves. In a guest to host drag the first motion is the move
++ *    that UpdateDetWnd() makes through SimulateXEvents() after this returns,
++ *    and on KWin a move before the window is ready loses the drag for its
++ *    whole duration.
++ *
++ * Results:
++ *    True if the window is managed, false if timeoutMs passed first.
++ *
++ * Side effects:
++ *    Sleeps without running the main loop.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DragDetWnd::WaitUntilManaged(unsigned int timeoutMs)  // IN
++{
++   Display *display;
++   Window xwindow;
++
++   if (!GetXWindow(&display, &xwindow)) {
++      return false;
++   }
++
++   const unsigned int stepMs = 10;
++   const unsigned int settleMs = 40;
++   gint64 deadline = g_get_monotonic_time() + timeoutMs * 1000;
++   gint64 started = g_get_monotonic_time();
++
++   /*
++    * Do not call g_main_context_iteration() here. This runs from an RPC
++    * handler, and iterating the main loop dispatches the RPC source again.
++    * GuestDnDMgr::OnRpcQueryExiting() shows the detection window before it
++    * records the session id, so a command delivered from inside this call
++    * would run the whole sequence again, and the outer call would then write
++    * the older session id last. Every later command for the real session is
++    * rejected after that, and drag and drop stays broken until a reset.
++    *
++    * Nothing here needs the main loop. The window manager acts on the X
++    * requests that Show() and SetGeometry() have already flushed, so
++    * _NET_CLIENT_LIST is updated whether or not this process is running its
++    * own loop.
++    */
++   while (g_get_monotonic_time() < deadline) {
++      if (DetWndIsManaged(display, xwindow)) {
++         g_usleep(settleMs * 1000);
++         g_debug("%s: detwnd 0x%lx managed after %" G_GINT64_FORMAT "ms\n",
++                 __FUNCTION__, (unsigned long) xwindow,
++                 (g_get_monotonic_time() - started) / 1000);
++         RequestSkipTaskbar();
++         return true;
++      }
++      g_usleep(stepMs * 1000);
++   }
++
++   g_warning("%s: detwnd 0x%lx still not managed after %ums; the drag will "
++             "probably be offered to another window\n", __FUNCTION__,
++             (unsigned long) xwindow, timeoutMs);
++
++   return false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::GetXWindow --
++ *
++ *    Look up the X display and the X window of the detection window.
++ *
++ * Results:
++ *    True if the window has an X11 surface, and then *display and *xwindow
++ *    are set.
++ *
++ * Side effects:
++ *    None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DragDetWnd::GetXWindow(Display **display,  // OUT
++                       Window *xwindow)    // OUT
++{
++   GtkNative *native = gtk_widget_get_native(GetWnd()->gobj());
++   GdkSurface *surface = native ? gtk_native_get_surface(native) : NULL;
++
++   if (surface == NULL || !GDK_IS_X11_SURFACE(surface)) {
++      return false;
++   }
++   *display = gdk_x11_display_get_xdisplay(gdk_surface_get_display(surface));
++   *xwindow = gdk_x11_surface_get_xid(surface);
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::SendWmState --
++ *
++ *    Ask the window manager to add or remove up to two _NET_WM_STATE atoms
++ *    on the mapped detection window.
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    Sends a client message to the root window.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DragDetWnd::SendWmState(long action,   // IN: 1 to add, 0 to remove
++                        Atom first,    // IN
++                        Atom second,   // IN: or None
++                        long source)   // IN: 1 application, 2 pager
++{
++   Display *display;
++   Window xwindow;
++   XEvent ev;
++
++   if (!GetXWindow(&display, &xwindow)) {
++      return;
++   }
++
++   memset(&ev, 0, sizeof ev);
++   ev.xclient.type = ClientMessage;
++   ev.xclient.window = xwindow;
++   ev.xclient.message_type = XInternAtom(display, "_NET_WM_STATE", False);
++   ev.xclient.format = 32;
++   ev.xclient.data.l[0] = action;
++   ev.xclient.data.l[1] = first;
++   ev.xclient.data.l[2] = second;
++   ev.xclient.data.l[3] = source;
++   XSendEvent(display, DefaultRootWindow(display), False,
++              SubstructureNotifyMask | SubstructureRedirectMask, &ev);
++   XFlush(display);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::RequestSkipTaskbar --
++ *
++ *    Keep the detection window out of the taskbar and pager.
++ *
++ *    The window manager reads the _NET_WM_STATE property only before the
++ *    window is mapped, and GTK rewrites that property when it maps the
++ *    window. Once the window is mapped, the state has to be requested with a
++ *    client message.
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    Sends a client message to the root window.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DragDetWnd::RequestSkipTaskbar(void)
++{
++   Display *display;
++   Window xwindow;
++
++   if (!GetXWindow(&display, &xwindow)) {
++      return;
++   }
++
++   SendWmState(1,
++               XInternAtom(display, "_NET_WM_STATE_SKIP_TASKBAR", False),
++               XInternAtom(display, "_NET_WM_STATE_SKIP_PAGER", False), 1);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::ApplyDetWndMode --
++ *
++ *    Set the window manager hints of the detection window.
++ *
++ *    Under Wayland the window has to stay managed. A compositor bridging a
++ *    native Wayland drag to an Xwayland window looks for the target among its
++ *    managed clients only, so an override-redirect detection window never
++ *    receives XdndEnter. On KWin the lookup is Workspace::findClient(),
++ *    called from XwlDropHandler::updateDragTarget(), and pickDragTarget()
++ *    skips anything that is not a client.
++ *
++ *    Under Wayland hints also keep the window from being activated. They are
++ *    _NET_WM_WINDOW_TYPE_DND, _NET_WM_USER_TIME 0 and WM_HINTS input False.
++ *    Under Xorg the window is activated when it is shown, so it gets none of
++ *    these. Both get fixed size hints, the requested position, and skip
++ *    taskbar and skip pager.
++ *
++ *    The window manager reads these when the window is mapped, and the X
++ *    window exists only once GTK has shown it. This therefore runs while the
++ *    window is shown, for the next map to see. It is idempotent and is called
++ *    from both the constructor and Show().
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    Changes window attributes and properties on the X server.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DragDetWnd::ApplyDetWndMode(void)
++{
++   Display *display;
++   Window xwindow;
++
++   if (!GetXWindow(&display, &xwindow)) {
++      g_debug("%s: no X11 surface; detection window may steal focus\n",
++              __FUNCTION__);
++      return;
++   }
++
++   GdkDisplay *gdkDisplay = gdk_display_get_default();
++   XSetWindowAttributes attrs;
++
++   gdk_x11_display_error_trap_push(gdkDisplay);
++
++   attrs.override_redirect = False;
++   XChangeWindowAttributes(display, xwindow, CWOverrideRedirect, &attrs);
++
++   /*
++    * Set fixed size hints, the ICCCM way to say that a window cannot usefully
++    * be resized. A tiling compositor such as sway then floats the window
++    * rather than fitting it into the layout. A tiled 124x124 detection
++    * window is stretched over the whole output, covers the drop target and
++    * takes the drop.
++    */
++   {
++      XSizeHints *hints = XAllocSizeHints();
++
++      if (hints != NULL) {
++         hints->flags = PMinSize | PMaxSize;
++         /*
++          * Also the position SetGeometry() asked for. Without it the window
++          * manager places a newly mapped window itself, and on the first
++          * map it ends up somewhere other than where the move asked.
++          */
++         if (mPlaced) {
++            hints->flags |= USPosition | PPosition;
++            hints->x = mPlacedX;
++            hints->y = mPlacedY;
++         }
++         hints->min_width = hints->max_width = DRAG_DET_WINDOW_WIDTH * 2;
++         hints->min_height = hints->max_height = DRAG_DET_WINDOW_WIDTH * 2;
++         XSetWMNormalHints(display, xwindow, hints);
++         XFree(hints);
++      }
++   }
++
++   if (mUnderWayland) {
++      Atom wmType = XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
++      Atom wmTypeDnd = XInternAtom(display, "_NET_WM_WINDOW_TYPE_DND", False);
++      XChangeProperty(display, xwindow, wmType, XA_ATOM, 32, PropModeReplace,
++                      (unsigned char *) &wmTypeDnd, 1);
++
++      Atom userTime = XInternAtom(display, "_NET_WM_USER_TIME", False);
++      unsigned long zero = 0;
++      XChangeProperty(display, xwindow, userTime, XA_CARDINAL, 32,
++                      PropModeReplace, (unsigned char *) &zero, 1);
++   }
++
++   {
++      Atom skipTaskbar =
++         XInternAtom(display, "_NET_WM_STATE_SKIP_TASKBAR", False);
++      Atom skipPager = XInternAtom(display, "_NET_WM_STATE_SKIP_PAGER", False);
++      Atom wmState = XInternAtom(display, "_NET_WM_STATE", False);
++      Atom states[2];
++
++      states[0] = skipTaskbar;
++      states[1] = skipPager;
++      XChangeProperty(display, xwindow, wmState, XA_ATOM, 32, PropModeReplace,
++                      (unsigned char *) states, 2);
++
++      /*
++       * The window manager reads this property only while the window is
++       * unmapped, and GTK rewrites it when it maps the window.
++       * RequestSkipTaskbar() requests the state again with a client message
++       * once the window is managed.
++       */
++   }
++
++   if (mUnderWayland) {
++      /*
++       * Under ICCCM 4.1.7, input False tells the window manager not to give
++       * this window the keyboard focus. Where WM_PROTOCOLS has no
++       * WM_TAKE_FOCUS, it also makes KWin's wantsInput() false, so the
++       * requestFocus() that KWin's drag filter issues for the window under
++       * the cursor cannot activate it.
++       */
++      XWMHints *hints = XGetWMHints(display, xwindow);
++      XWMHints fresh;
++
++      if (hints == NULL) {
++         memset(&fresh, 0, sizeof fresh);
++         hints = &fresh;
++      }
++      hints->flags |= InputHint;
++      hints->input = False;
++      XSetWMHints(display, xwindow, hints);
++      if (hints != &fresh) {
++         XFree(hints);
++      }
++   }
++
++   XFlush(display);
++
++   gdk_x11_display_error_trap_pop_ignored(gdkDisplay);
++}
++
++
+ /**
+  * Lower the window.
+  */
+@@ -717,6 +1226,27 @@ DragDetWnd::SetGeometry(const int x,
+       if (GDK_IS_X11_SURFACE(surface)) {
+          Display* display = gdk_x11_display_get_xdisplay(gdk_surface_get_display(surface));
+          Window xwindow = gdk_x11_surface_get_xid(surface);
++         XSizeHints *hints = XAllocSizeHints();
++
++         mPlaced = true;
++         mPlacedX = x;
++         mPlacedY = y;
++         /*
++          * The next map honours this position. ApplyDetWndMode() explains
++          * why.
++          */
++         if (hints != NULL) {
++            long supplied = 0;
++
++            if (!XGetWMNormalHints(display, xwindow, hints, &supplied)) {
++               hints->flags = 0;
++            }
++            hints->flags |= USPosition | PPosition;
++            hints->x = x;
++            hints->y = y;
++            XSetWMNormalHints(display, xwindow, hints);
++            XFree(hints);
++         }
+          XMoveWindow(display, xwindow, x, y);
+          XFlush(display);
+       }
+@@ -772,7 +1302,7 @@ DragDetWnd::GetGeometry(int &x, int &y, int &width, int &height)
+  */
+ 
+ void
+-DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y)
++DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
+ {
+   g_debug("%s: enter 0x%lx show %d x %d y %d\n",
+          __FUNCTION__,
+@@ -780,17 +1310,44 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y)
+ 
+    /* If the window is being shown, move it to the right place. */
+    if (show) {
++      /* Before the map as well, so that the map itself uses the position. */
++      SetGeometry(x, y, DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
+       Show();
+       Raise();
+       SetGeometry(x, y, DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
++
++      /*
++       * Under Wayland, wait for the window manager to adopt the window only
++       * now, with the window at its final size and position. The mouse move
++       * below is the only motion the compositor will see, and it must come
++       * after that. Under Xorg the drag source looks up the window under the
++       * pointer in the X server on each motion, and the window needs nothing
++       * from the window manager but the map.
++       *
++       * Wait only when the window has to receive a drag. The wait takes
++       * 100ms or more, up to DET_WND_MANAGE_TIMEOUT_MS, and a drag source
++       * does not have to be found. During a host to guest drop the window is
++       * the drag source, and the delay there loses the drop target, so the
++       * drag ends in GDK_DRAG_CANCEL_NO_TARGET.
++       */
++      if (asDropTarget && mUnderWayland) {
++         WaitUntilManaged(DET_WND_MANAGE_TIMEOUT_MS);
++      }
+       g_debug("%s: show at (%d, %d, %d, %d)\n", __FUNCTION__, x, y, DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
+       /*
+        * Wiggle the mouse here. Especially for G->H DnD, this improves
+        * reliability of making the drag escape the guest window immensly.
+        * Stolen from the legacy V2 DnD code.
++       *
++       * Not during a host to guest drop. There the pointer is already on the
++       * target the host chose, and this window is the drag source, so moving
++       * the pointer onto it takes the drag off that target moments before the
++       * button is released. Under a compositor the move is real input, and
++       * the target does not get re-entered before the release arrives.
+        */
+-
+-      SimulateMouseMove(x + 2, y + 2);
++      if (asDropTarget) {
++         SimulateMouseMove(x + 2, y + 2);
++      }
+       SetIsVisible(true);
+    } else {
+       g_debug("%s: hide\n", __FUNCTION__);
+@@ -1065,6 +1622,19 @@ DragDetWnd::SimulateXEvents(const bool showWidget, const bool buttonEvent,
+        FakeMouse_Move(x, y);
+        FakeMouse_Move(x + 1, y + 1);
+        g_debug("%s: Uinput simulating moving mouse\n", __FUNCTION__);
++
++       /*
++        * uinput moves the compositor's pointer, not the X server's copy of
++        * it. Under Xwayland an X client learns the real position only while
++        * the pointer is over one of its own surfaces, so XQueryPointer goes on
++        * reporting the last position it saw. XDND picks its target from the
++        * pointer position, so the drag source looks in the wrong place and the
++        * detection window is never offered the drag.
++        *
++        * Warp the X pointer to the same coordinates so both agree.
++        */
++       XWarpPointer(dndXDisplay, None, DefaultRootWindow(dndXDisplay),
++                    0, 0, 0, 0, x + 1, y + 1);
+ #endif
+    } else {
+        XTestFakeMotionEvent(dndXDisplay, -1, x, y, CurrentTime);
+diff --git a/vmware-user-suid-wrapper/main.c b/vmware-user-suid-wrapper/main.c
+index 73ae9b9..899aaca 100644
+--- a/vmware-user-suid-wrapper/main.c
++++ b/vmware-user-suid-wrapper/main.c
+@@ -202,10 +202,19 @@ StartVMwareUser(char *const envp[])
+ 
+    /* Child */
+ 
++   /*
++    * A compositor started from a text console, such as sway, leaves
++    * XDG_SESSION_TYPE at "tty", so a Wayland display outside an X11 session
++    * counts too. The plugin chooses its backend the same way.
++    */
+    xdgSessionType = getenv("XDG_SESSION_TYPE");
+    if (   (xdgSessionType != NULL)
+        && (strstr(xdgSessionType, "wayland") != NULL)) {
+       useWayland = TRUE;
++   } else if (   (getenv("WAYLAND_DISPLAY") != NULL)
++              && (   (xdgSessionType == NULL)
++                  || (strcmp(xdgSessionType, "x11") != 0))) {
++      useWayland = TRUE;
+    }
+ 
+    /*
+-- 
+2.55.0
+

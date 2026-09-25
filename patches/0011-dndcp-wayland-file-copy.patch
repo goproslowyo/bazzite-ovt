@@ -1,0 +1,861 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:10 -0700
+Subject: [PATCH 11/21] dndcp: Send guest file lists to the host in a Wayland
+ session
+
+Send a guest file copy to the host. A file selection is checked first,
+before an image or text, because it also advertises a text rendering of
+the paths. The backend reads text/uri-list, or
+x-special/gnome-copied-files where a selection offers only that. It
+parses each entry on its own and skips one that names no local file,
+such as a trash: URI, so that the rest of the list still goes to the
+host. Lists are compared after parsing, so the same list in another
+rendering reads as unchanged.
+
+A path is refused when it is relative, has a . or .. component, or has
+no usable last component, which the host names its copy after. Paths
+inside the vmblock mount are skipped, because a lookup there blocks
+until the main loop lifts the block, and the host has no reason to pull
+its own files back. For that the UI now gets the backend's vmblock
+control, which a later patch brings up.
+
+The host shows the total size of the files. The paths are sized on a
+separate thread, without following symlinks, and the main loop waits for
+it only until the request's deadline. A walk still running then is told
+to stop, and the list goes to the host with the part of the size that
+was counted. At most one walk runs at a time.
+
+The backend now advertises file copy and paste. A host file copy is
+pasted from the next patch on.
+---
+ .../plugins/dndcp/copyPasteDnDWayland.cpp     |   7 +-
+ services/plugins/dndcp/copyPasteUIWayland.cpp | 648 +++++++++++++++++-
+ services/plugins/dndcp/copyPasteUIWayland.h   |  23 +-
+ .../dndcp/dndGuestBase/copyPasteDnDWayland.h  |   1 +
+ 4 files changed, 672 insertions(+), 7 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+index ea41d2c..e9246f9 100644
+--- a/services/plugins/dndcp/copyPasteDnDWayland.cpp
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+@@ -58,6 +58,7 @@ CopyPasteDnDWayland::CopyPasteDnDWayland()
+ #endif
+    m_haveGtk(false)
+ {
++   memset(&m_blockCtrl, 0, sizeof m_blockCtrl);
+ }
+ 
+ 
+@@ -186,6 +187,7 @@ CopyPasteDnDWayland::RegisterCP()
+ 
+    m_copyPasteUI = new CopyPasteUIWayland();
+    if (m_copyPasteUI) {
++      m_copyPasteUI->SetBlockControl(&m_blockCtrl);
+       if (m_copyPasteUI->Init()) {
+          wrapper->SetCPIsRegistered(TRUE);
+          int version = wrapper->GetCPVersion();
+@@ -390,8 +392,8 @@ CopyPasteDnDWayland::SetDnDAllowed(bool allowed)
+  *
+  * CopyPasteDnDWayland::GetCaps --
+  *
+- *    Report what this backend supports, which is copy and paste of text, RTF
+- *    and PNG images.
++ *    Report what this backend supports, which is copy and paste of text, RTF,
++ *    PNG images and file lists.
+  *
+  *    Copy and paste owns the Wayland selection directly, so one selection can
+  *    carry rich text and its plain rendering at once.
+@@ -407,6 +409,7 @@ CopyPasteDnDWayland::GetCaps()
+           DND_CP_CAP_PLAIN_TEXT_CP |
+           DND_CP_CAP_RTF_CP |
+           DND_CP_CAP_IMAGE_CP |
++          DND_CP_CAP_FILE_CP |
+           DND_CP_CAP_ACTIVE_CP |
+           DND_CP_CAP_BIG_BUFFER;
+ }
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+index 9143f74..597bc04 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.cpp
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp
+@@ -39,22 +39,28 @@
+ #include <errno.h>
+ #include <signal.h>
+ #include <string.h>
++#include <dirent.h>
+ #include <sys/poll.h>
++#include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#include <fcntl.h>
+ #include <gtk/gtk.h>
+ 
+ #include "vmware.h"
+ #include "copyPasteUIWayland.h"
+ #include "waylandClipboard.h"
+ #include "guestDnDCPMgr.hh"
++#include "dndFileList.hh"
+ #include "dndMsg.h"
+ 
+ extern "C" {
++#include "dynbuf.h"
+ #include "file.h"
+ #include "str.h"
+ #include "util.h"
+ #include "dndCPMsgV4.h"
++#include "vmblock.h"
+ 
+ #include <X11/Xlib.h>
+ #include <X11/Xatom.h>
+@@ -1063,7 +1069,8 @@ CopyPasteUIWayland::CopyPasteUIWayland()
+    mXReaderOpen(false),
+    mSelectionGeneration(0),
+    mReadGeneration(G_MAXUINT64),
+-   mRetriedGeneration(G_MAXUINT64)
++   mRetriedGeneration(G_MAXUINT64),
++   mBlockCtrl(NULL)
+ {
+    GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
+    ASSERT(p);
+@@ -1208,6 +1215,7 @@ CopyPasteUIWayland::ClearLastClipboard(void)
+    mLastClipboardText.clear();
+    mLastClipboardImage.clear();
+    mLastClipboardRtf.clear();
++   mLastClipboardFiles.clear();
+ }
+ 
+ 
+@@ -1457,8 +1465,8 @@ CopyPasteUIWayland::GetSelectionGeneration(guint64 *generation)  // OUT
+  *
+  * CopyPasteUIWayland::GetLocalClipboard --
+  *
+- *    Read the local selection and send it to the host. An image comes first,
+- *    then rich text with its plain text rendering, then plain text.
++ *    Read the local selection and send it to the host. Files come first, then
++ *    an image, then rich text with its plain text rendering, then plain text.
+  *    When copy and paste is allowed, every request gets one reply, with an
+  *    empty or not-changed clip when there is nothing new, so that the host
+  *    request does not hang.
+@@ -1529,7 +1537,29 @@ CopyPasteUIWayland::GetLocalClipboard(void)
+    CPClipboard_Clear(&mClipboard);
+ 
+    /*
+-    * An image first, as in copyPasteUIX11.cpp. An image selection often also
++    * Files first. A file selection also advertises a text rendering of the
++    * paths, and taking that would turn a file copy into a copy of filenames.
++    */
++   if (mCP->CheckCapability(DND_CP_CAP_FILE_CP) &&
++       (CopyPasteWaylandHasType(FCP_TARGET_NAME_URI_LIST, deadline) ||
++        CopyPasteWaylandHasType(FCP_TARGET_NAME_GNOME_COPIED_FILES,
++                                 deadline))) {
++      switch (GetLocalFileList(deadline)) {
++      case FILELIST_SET:
++         SendLocalClip();
++         return;
++      case FILELIST_UNCHANGED:
++         SendClipNotChanged();
++         return;
++      case FILELIST_UNUSABLE:
++         g_debug("%s: uri-list present but unusable, falling through\n",
++                 __FUNCTION__);
++         break;
++      }
++   }
++
++   /*
++    * Then an image, as in copyPasteUIX11.cpp. An image selection often also
+     * advertises a text/plain rendering, such as a filename or a URL, and
+     * reading the text would lose the image.
+     */
+@@ -1677,6 +1707,616 @@ CopyPasteUIWayland::GetLocalClipboard(void)
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandParseUriList --
++ *
++ *    Split a text/uri-list, or the x-special/gnome-copied-files rendering of
++ *    one, into unescaped paths.
++ *
++ *    The same file selection arrives spelled several ways, with CRLF or LF
++ *    line ends and with or without an operation line in front. Comparing
++ *    parsed paths rather than bytes lets this client recognise a selection
++ *    it published when it comes back in another rendering.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++CopyPasteWaylandParseUriList(const std::string &source,        // IN
++                             std::vector<std::string> &paths)  // OUT
++{
++   size_t first = source.find_first_not_of("\r\n ");
++   size_t pos = 0;
++
++   paths.clear();
++
++   while (pos < source.size()) {
++      size_t end = source.find_first_of("\r\n", pos);
++      size_t start = pos;
++      size_t index = 0;
++      size_t len = 0;
++      char *path;
++
++      if (end == std::string::npos) {
++         end = source.size();
++      }
++      pos = end + 1;
++
++      start = source.find_first_not_of(' ', start);
++      if (start == std::string::npos || start >= end) {
++         continue;
++      }
++
++      std::string line = source.substr(start, end - start);
++
++      /*
++       * Some desktops prefix the list with the intended operation. KDE
++       * signals this out of band with application/x-kde-cutselection
++       * instead. Skip the prefix so one code path serves both.
++       */
++      if (start == first && (line == "copy" || line == "cut")) {
++         continue;
++      }
++
++      /*
++       * Take each entry on its own. DnD_UriListGetNextFile() stops at the
++       * first entry it does not support, such as a trash: or recent: URI,
++       * and the entries after it would be lost. A '#' line is a comment.
++       */
++      if (line[0] == '#' ||
++          (line.compare(0, sizeof DND_URI_LIST_PRE_KDE - 1,
++                        DND_URI_LIST_PRE_KDE) != 0 &&
++           !DnD_UriIsNonFileSchemes(line.c_str()))) {
++         g_debug("%s: skipping an unsupported entry\n", __FUNCTION__);
++         continue;
++      }
++
++      path = DnD_UriListGetNextFile(line.c_str(), &index, &len);
++      if (path != NULL) {
++         /* Keep the unescaped length, because the path may contain a NUL. */
++         paths.push_back(std::string(path, len));
++         free(path);
++      }
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandNormalizePath --
++ *
++ *    Collapse repeated and trailing separators so a path can be compared
++ *    against a directory by prefix.
++ *
++ * Results:
++ *    false for a relative path or one with a "." or ".." component. File
++ *    managers do not put those on a clipboard, and resolving ".." lexically
++ *    disagrees with the kernel whenever a symlink precedes it, so such a
++ *    path is refused.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandNormalizePath(const std::string &path,  // IN
++                              std::string &out)         // OUT
++{
++   size_t i = 0;
++
++   out.clear();
++   if (path.empty() || path[0] != '/') {
++      return false;
++   }
++   while (i < path.size()) {
++      size_t end;
++
++      while (i < path.size() && path[i] == '/') {
++         i++;
++      }
++      if (i == path.size()) {
++         break;
++      }
++      end = path.find('/', i);
++      if (end == std::string::npos) {
++         end = path.size();
++      }
++
++      std::string comp = path.substr(i, end - i);
++      if (comp == "." || comp == "..") {
++         return false;
++      }
++      out += '/';
++      out += comp;
++      i = end;
++   }
++   if (out.empty()) {
++      out = "/";
++   }
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandHasControlChar --
++ *
++ *    Whether s holds an ASCII control character.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandHasControlChar(const std::string &s)  // IN
++{
++   size_t i;
++
++   for (i = 0; i < s.size(); i++) {
++      unsigned char c = (unsigned char) s[i];
++
++      if (c < 0x20 || c == 0x7f) {
++         return true;
++      }
++   }
++   return false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandIsUnderVmblock --
++ *
++ *    Is path inside the vmblock file system?
++ *
++ *    A lookup of a blocked entry there does not return until the block is
++ *    lifted, and GetLocalFilesDone() lifts it from the main loop. A stat of
++ *    such a path from the main loop would therefore never return. The host
++ *    has no reason to pull anything under the mount, since the entries are
++ *    its own files on their way in.
++ *
++ *    /var/run is normally a symlink to /run, so both spellings are checked.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandIsUnderVmblock(const std::string &path,  // IN: normalized
++                               const char *blockRoot)    // IN/OPT
++{
++   const char *roots[] = {
++      VMBLOCK_MOUNT_POINT,
++      VMBLOCK_FUSE_MOUNT_POINT,
++      VMBLOCK_FS_ROOT,
++      VMBLOCK_FUSE_NOTIFY_ROOT,
++      blockRoot,
++   };
++   size_t i;
++
++   for (i = 0; i < G_N_ELEMENTS(roots); i++) {
++      std::string root;
++      int alias;
++
++      if (roots[i] == NULL || roots[i][0] != '/' ||
++          !CopyPasteWaylandNormalizePath(roots[i], root)) {
++         continue;
++      }
++      for (alias = 0; alias < 2; alias++) {
++         if (alias == 1) {
++            if (root.compare(0, 9, "/var/run/") != 0) {
++               break;
++            }
++            root.erase(0, 4);
++         }
++         if (path == root ||
++             (path.size() > root.size() &&
++              path.compare(0, root.size(), root) == 0 &&
++              path[root.size()] == '/')) {
++            return true;
++         }
++      }
++   }
++   return false;
++}
++
++
++/*
++ * Sizing a guest file selection for the host.
++ *
++ * The paths come from whichever client owns the selection. Sizing a
++ * directory means walking it, and "/" is a valid entry. A lookup that passes
++ * through a symlink into the vmblock mount also blocks until the main loop
++ * lifts the block. The walk therefore runs on a thread of its own, and the
++ * main loop waits for it only until the request deadline. A walk still
++ * running then is told to stop, and finishes on its own. The walk does not
++ * follow symlinks and opens nothing but directories, so a FIFO cannot stall
++ * it. The host uses the size for information only, so a partial count is
++ * sent rather than no list.
++ */
++
++#define CP_SIZE_MAX_ENTRIES 100000
++#define CP_SIZE_MAX_DEPTH   64
++
++typedef struct {
++   gint refs;
++   gint cancelled;
++   GMutex lock;
++   GCond cond;
++   bool done;
++   uint64 total;           /* Protected by lock. */
++   unsigned int entries;   /* Only touched by the walker. */
++   std::vector<std::string> paths;
++} CopyPasteSizeJob;
++
++/*
++ * At most one walk runs at a time. A walk that never finishes stops later
++ * sizing instead of adding threads.
++ */
++static gint gSizeJobsRunning = 0;
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteSizeJobUnref --
++ *
++ *    Drop one reference to job, and free it with the last one.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++CopyPasteSizeJobUnref(CopyPasteSizeJob *job)  // IN
++{
++   if (g_atomic_int_dec_and_test(&job->refs)) {
++      g_mutex_clear(&job->lock);
++      g_cond_clear(&job->cond);
++      delete job;
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteSizeJobStop --
++ *
++ *    Whether the walk should stop, because the main loop gave up waiting for it
++ *    or it has visited CP_SIZE_MAX_ENTRIES entries.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteSizeJobStop(CopyPasteSizeJob *job)  // IN
++{
++   return g_atomic_int_get(&job->cancelled) ||
++          job->entries >= CP_SIZE_MAX_ENTRIES;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteSizeDir --
++ *
++ *    Add up the sizes of the regular files under a directory, down to
++ *    CP_SIZE_MAX_DEPTH levels, without following symlinks.
++ *
++ * Results:
++ *    The total in bytes. dirFd is closed.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static uint64
++CopyPasteSizeDir(CopyPasteSizeJob *job,  // IN
++                 int dirFd,              // IN: consumed
++                 unsigned int depth)     // IN
++{
++   DIR *dir = fdopendir(dirFd);
++   struct dirent *ent;
++   uint64 total = 0;
++
++   if (dir == NULL) {
++      close(dirFd);
++      return 0;
++   }
++   while (!CopyPasteSizeJobStop(job) && (ent = readdir(dir)) != NULL) {
++      struct stat st;
++
++      if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
++         continue;
++      }
++      job->entries++;
++      if (fstatat(dirfd(dir), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
++         continue;
++      }
++      if (S_ISREG(st.st_mode)) {
++         total += (uint64) st.st_size;
++      } else if (S_ISDIR(st.st_mode) && depth < CP_SIZE_MAX_DEPTH) {
++         int fd = openat(dirfd(dir), ent->d_name,
++                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK |
++                         O_CLOEXEC);
++
++         if (fd >= 0) {
++            total += CopyPasteSizeDir(job, fd, depth + 1);
++         }
++      }
++   }
++   closedir(dir);
++   return total;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteSizeThread --
++ *
++ *    The thread that walks job->paths. It adds each path's size to job->total,
++ *    signals job->cond when it is done, and drops its reference to job.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static gpointer
++CopyPasteSizeThread(gpointer data)  // IN
++{
++   CopyPasteSizeJob *job = (CopyPasteSizeJob *) data;
++   size_t i;
++
++   for (i = 0; i < job->paths.size() && !CopyPasteSizeJobStop(job); i++) {
++      const char *path = job->paths[i].c_str();
++      struct stat st;
++      uint64 size = 0;
++
++      job->entries++;
++      if (fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW) != 0) {
++         continue;
++      }
++      if (S_ISREG(st.st_mode)) {
++         size = (uint64) st.st_size;
++      } else if (S_ISDIR(st.st_mode)) {
++         int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK |
++                             O_CLOEXEC);
++
++         if (fd >= 0) {
++            size = CopyPasteSizeDir(job, fd, 0);
++         }
++      }
++
++      g_mutex_lock(&job->lock);
++      job->total += size;
++      g_mutex_unlock(&job->lock);
++   }
++
++   g_mutex_lock(&job->lock);
++   job->done = true;
++   g_cond_signal(&job->cond);
++   g_mutex_unlock(&job->lock);
++
++   g_atomic_int_add(&gSizeJobsRunning, -1);
++   CopyPasteSizeJobUnref(job);
++   return NULL;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandSizePaths --
++ *
++ *    Add up the sizes of paths, giving up at deadline.
++ *
++ * Results:
++ *    The total counted, which is short of the truth when the walk was cut
++ *    off or could not be started.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static uint64
++CopyPasteWaylandSizePaths(const std::vector<std::string> &paths,  // IN
++                          gint64 deadline)                        // IN
++{
++   CopyPasteSizeJob *job;
++   GThread *thread;
++   GError *err = NULL;
++   uint64 total;
++   bool done;
++
++   if (paths.empty()) {
++      return 0;
++   }
++   if (g_atomic_int_get(&gSizeJobsRunning) > 0) {
++      g_debug("%s: an earlier walk is still running, not sizing\n",
++              __FUNCTION__);
++      return 0;
++   }
++
++   job = new CopyPasteSizeJob;
++   job->refs = 2;
++   job->cancelled = 0;
++   g_mutex_init(&job->lock);
++   g_cond_init(&job->cond);
++   job->done = false;
++   job->total = 0;
++   job->entries = 0;
++   job->paths = paths;
++
++   g_atomic_int_inc(&gSizeJobsRunning);
++   thread = g_thread_try_new("dndcp-size", CopyPasteSizeThread, job, &err);
++   if (thread == NULL) {
++      g_debug("%s: could not start the walk: %s\n", __FUNCTION__,
++              err != NULL ? err->message : "unknown error");
++      g_clear_error(&err);
++      g_atomic_int_add(&gSizeJobsRunning, -1);
++      job->refs = 1;
++      CopyPasteSizeJobUnref(job);
++      return 0;
++   }
++   g_thread_unref(thread);
++
++   g_mutex_lock(&job->lock);
++   while (!job->done) {
++      if (!g_cond_wait_until(&job->cond, &job->lock, deadline)) {
++         break;
++      }
++   }
++   done = job->done;
++   total = job->total;
++   g_mutex_unlock(&job->lock);
++
++   if (!done) {
++      g_debug("%s: walk cut off at the deadline\n", __FUNCTION__);
++      g_atomic_int_set(&job->cancelled, 1);
++   }
++   CopyPasteSizeJobUnref(job);
++   return total;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::GetLocalFileList --
++ *
++ *    Turn the local text/uri-list selection into a CPFORMAT_FILELIST item for
++ *    the host. No vmblock is involved in this direction, because the host
++ *    pulls the contents itself once it has the list.
++ *
++ *    Mirrors CopyPasteUIX11::LocalGetSelectionFileList.
++ *
++ * Results:
++ *    FILELIST_SET when a file list was placed on mClipboard, FILELIST_UNCHANGED
++ *    when the selection is the one already reported to the host, and
++ *    FILELIST_UNUSABLE when there is nothing here to send. The caller sends
++ *    the reply in every case, so that exactly one reply reaches the host.
++ *
++ * Side effects:
++ *    May add an item to mClipboard.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++CopyPasteUIWayland::FileListResult
++CopyPasteUIWayland::GetLocalFileList(gint64 deadline)  // IN: monotonic, us
++{
++   gsize uriLen = 0;
++   guchar *uriData = CopyPasteWaylandGetData(FCP_TARGET_NAME_URI_LIST,
++                                             deadline, &uriLen);
++
++   if (uriData == NULL) {
++      /*
++       * A selection may offer only the rendering that carries the operation
++       * with the URIs, and no plain list. That is all wl-copy can publish for
++       * a file selection, and all some file managers put on the clipboard.
++       */
++      uriData = CopyPasteWaylandGetData(FCP_TARGET_NAME_GNOME_COPIED_FILES,
++                                        deadline, &uriLen);
++   }
++
++   if (uriData == NULL) {
++      return FILELIST_UNUSABLE;
++   }
++
++   std::vector<std::string> paths;
++
++   CopyPasteWaylandParseUriList(std::string((const char *) uriData, uriLen),
++                                paths);
++   g_free(uriData);
++   if (paths.empty()) {
++      return FILELIST_UNUSABLE;
++   }
++
++   /*
++    * Check this before touching the file system. When this is the list
++    * published for a host paste, its paths are under a block that the main
++    * loop has not lifted yet.
++    */
++   if (paths == mLastClipboardFiles) {
++      g_debug("%s: local clipboard file list is unchanged\n", __FUNCTION__);
++      return FILELIST_UNCHANGED;
++   }
++
++   DnDFileList fileList;
++   std::vector<std::string> usable;
++   uint64 totalSize = 0;
++   unsigned int count = 0;
++   const char *blockRoot = mBlockCtrl != NULL ? mBlockCtrl->blockRoot : NULL;
++   size_t i;
++
++   for (i = 0; i < paths.size(); i++) {
++      std::string path;
++
++      if (DnD_UriIsNonFileSchemes(paths[i].c_str())) {
++         /*
++          * ssh, sftp, smb, dav and ftp URIs. The X11 backend maps these to
++          * local gvfs paths with GFile. This file does not use GIO, so skip
++          * them.
++          */
++         g_debug("%s: skipping non-file uri\n", __FUNCTION__);
++         continue;
++      }
++      if (!CopyPasteWaylandNormalizePath(paths[i], path)) {
++         g_debug("%s: skipping a relative path or one with . or ..\n",
++                 __FUNCTION__);
++         continue;
++      }
++      /*
++       * The host names its copy after the last component, so the path must
++       * have one, and it must be a plain name. Unescaping can put a line
++       * break or a NUL into it.
++       */
++      if (path == "/" || CopyPasteWaylandHasControlChar(paths[i])) {
++         g_debug("%s: skipping a path with no usable name\n", __FUNCTION__);
++         continue;
++      }
++      if (CopyPasteWaylandIsUnderVmblock(path, blockRoot)) {
++         g_debug("%s: skipping %s, which is inside vmblock\n", __FUNCTION__,
++                 path.c_str());
++         continue;
++      }
++
++      const char *relPath = strrchr(path.c_str(), DIRSEPC) + 1;
++
++      fileList.AddFile(path.c_str(), relPath);
++      usable.push_back(path);
++      count++;
++   }
++
++   if (count == 0) {
++      g_debug("%s: uri list produced no usable paths\n", __FUNCTION__);
++      return FILELIST_UNUSABLE;
++   }
++   totalSize = CopyPasteWaylandSizePaths(usable, deadline);
++
++   DynBuf buf;
++   DynBuf_Init(&buf);
++   fileList.SetFileSize(totalSize);
++   fileList.ToCPClipboard(&buf, false);
++
++   bool ok = CPClipboard_SetItem(&mClipboard, CPFORMAT_FILELIST,
++                                 DynBuf_Get(&buf), DynBuf_GetSize(&buf));
++   DynBuf_Destroy(&buf);
++
++   if (!ok) {
++      g_warning("%s: could not set the file list item\n", __FUNCTION__);
++      return FILELIST_UNUSABLE;
++   }
++
++   g_debug("%s: sending %u file(s), %" FMT64 "u bytes total\n",
++           __FUNCTION__, count, totalSize);
++
++   ClearLastClipboard();
++   mLastClipboardFiles = paths;
++   return FILELIST_SET;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.h b/services/plugins/dndcp/copyPasteUIWayland.h
+index 3ccf135..2a18969 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.h
++++ b/services/plugins/dndcp/copyPasteUIWayland.h
+@@ -29,7 +29,7 @@
+  * owner. This is the counterpart of copyPasteUIX11.h for the Wayland
+  * platform.
+  *
+- * Text, RTF and PNG images are supported.
++ * Text, RTF and PNG images are supported, and file lists from the guest.
+  */
+ 
+ #ifndef __COPYPASTE_UI_WAYLAND_H__
+@@ -62,6 +62,9 @@ public:
+    void SetCopyPasteAllowed(bool isCopyPasteAllowed)
+    { mCP->SetCopyPasteAllowed(isCopyPasteAllowed); }
+ 
++   void SetBlockControl(DnDBlockControl *blockCtrl)
++   { mBlockCtrl = blockCtrl; }
++
+ private:
+    /* Called when the host sends new clipboard contents. */
+    void GetRemoteClipboardCB(const CPClipboard *clip);
+@@ -72,11 +75,27 @@ private:
+    /* Forget the formats recorded in mLastClipboard*. */
+    void ClearLastClipboard(void);
+ 
++   /*
++    * Outcome of a guest -> host file list attempt. The caller has to be able
++    * to tell "nothing changed" from "nothing to send", because each host
++    * request must be answered exactly once and the two need different replies.
++    */
++   enum FileListResult {
++      FILELIST_UNUSABLE = 0,  /* Nothing to send; try the other formats. */
++      FILELIST_SET,           /* A file list is on mClipboard. */
++      FILELIST_UNCHANGED      /* Already reported to the host. */
++   };
++
++   /* Turn the local uri-list selection into a file list for the host. */
++   FileListResult GetLocalFileList(gint64 deadline);
++
+    GuestCopyPasteMgr *mCP;
+    CPClipboard mClipboard;
+    std::string mLastClipboardText;
+    std::string mLastClipboardImage;
+    std::string mLastClipboardRtf;
++   /* Parsed paths, so any rendering of the same list compares equal. */
++   std::vector<std::string> mLastClipboardFiles;
+    bool mInited;
+ 
+    /*
+@@ -101,6 +120,8 @@ private:
+    guint64 mReadGeneration;
+    /* The generation last read again after its reads ran out of time. */
+    guint64 mRetriedGeneration;
++
++   DnDBlockControl *mBlockCtrl;
+ };
+ 
+ #endif // __COPYPASTE_UI_WAYLAND_H__
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+index 0041413..9b6bad3 100644
+--- a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+@@ -64,6 +64,7 @@ private:
+    ToolsAppCtx *m_ctx;
+    CopyPasteUIWayland *m_copyPasteUI;
+    DnDUIX11 *m_dndUI;
++   DnDBlockControl m_blockCtrl;
+ #if defined(GTK3)
+    Gtk::Main *m_main;
+ #endif
+-- 
+2.55.0
+

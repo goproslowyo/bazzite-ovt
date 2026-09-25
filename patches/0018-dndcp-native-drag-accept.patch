@@ -1,0 +1,614 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:11 -0700
+Subject: [PATCH 18/21] dndcp: Release a native drag only once the target
+ accepts it
+
+The button must be released on the target's current answer. A Gtk target
+answers one pointer motion with one accept and two refusals. The host
+sends motions about 1.2 ms apart and releases as soon as it stops, so
+the last answer is wherever the target had got to, and about a third of
+the time that is a refusal. Before releasing, wait for an accept that
+stays current for 30 ms, for at most 500 ms per attempt. A target that
+refuses still ends the drag when the wait runs out. The block on the
+staged files goes in after the wait, since the target stats the files to
+decide.
+
+A file manager fetches the offer's contents and decides only on a motion
+that comes after they arrive. When the pointer has already stopped, move
+it one pixel and back. Thunar can also carry the contents of one drag
+into the next, when the pointer crossed its window faster than it kept
+up. It then refuses the next drag on files that are gone, without
+looking at the new offer, until it sees a leave. A short-lived overlay
+on each output takes the drag off Thunar and gives it back. The drag's
+own overlay cannot be used for that, because an unmapped layer surface
+returns to the unconfigured state, and KWin never configures it again.
+
+Measured with a host driving real drags on sway 1.11, files land in
+Thunar 4.20.9 and PCManFM, the target settles in 32 to 43 ms, and a drop
+onto no target is discarded. Host drags into Dolphin 26.08.1 on KDE
+Plasma 6.7.5 were tested by hand. In nested compositors, start_drag from
+a faked press serial and delivery to a native client also work on KWin
+6.7.5 and Mutter 50.5, and all three compositors refuse a
+wl_pointer.enter serial. The retry of WaylandDrag_Init() and the XDND
+fallback after a failed start have not been tested on a VM.
+---
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |   1 +
+ services/plugins/dndcp/dndUIX11GTK4.cpp       |  68 +++++
+ .../plugins/dndcp/waylandDrag/waylandDrag.c   | 280 +++++++++++++++++-
+ .../plugins/dndcp/waylandDrag/waylandDrag.h   |  18 ++
+ .../dndcp/waylandDrag/waylandDragStub.c       |  16 +
+ 5 files changed, 372 insertions(+), 11 deletions(-)
+
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index 19ad04d..3bd08b2 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -158,6 +158,7 @@ private:
+    bool LocalStartWaylandDrag(int32 x, int32 y);
+    void LocalCancelWaylandDrag(void);
+    static void OnWaylandDragDone(void *ctx);
++   static void NudgeWaylandDrag(void *ctx);
+ 
+    /*
+     * The argument to the native drag's done(). It records which drag it was,
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index 2937cee..85b155c 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -68,6 +68,16 @@ extern "C" {
+  */
+ #define WAYLAND_DRAG_PRESS_TIMEOUT_MS 250
+ 
++/*
++ * How long the target has to catch up with the pointer before the button is
++ * released. A file manager that will take the drop accepts within a few tens
++ * of milliseconds. OnSrcDrop() waits this long up to three times, with a
++ * nudge and then WaylandDrag_Refocus() in between, and then releases the
++ * button whatever the target said. A target that still refuses loses the
++ * drop.
++ */
++#define WAYLAND_DRAG_ACCEPT_TIMEOUT_MS 500
++
+ 
+ /*
+  *-----------------------------------------------------------------------------
+@@ -1532,6 +1542,30 @@ DnDUIX11::OnDestCancel()
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::NudgeWaylandDrag --
++ *
++ *      Move the pointer one pixel and back. The compositor and the target
++ *      under the drag check the drag again only on pointer motion.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::NudgeWaylandDrag(void *ctx)   // IN: the DnDUIX11
++{
++#ifdef USE_UINPUT
++   DnDUIX11 *ui = static_cast<DnDUIX11 *>(ctx);
++
++   FakeMouse_Move(ui->mMousePosX > 0 ? ui->mMousePosX - 1 : ui->mMousePosX + 1,
++                  ui->mMousePosY);
++   FakeMouse_Move(ui->mMousePosX, ui->mMousePosY);
++#endif
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -1563,6 +1597,40 @@ DnDUIX11::OnSrcDrop()
+        * connection only.
+        */
+       FakeMouse_Move(mMousePosX, mMousePosY);
++
++      /*
++       * The compositor decides the drop on the target's last answer. The
++       * host moves the pointer faster than a file manager answers, so when
++       * the host lets go, the last answer is often a refusal for an earlier
++       * motion. Give the target time to catch up before releasing the
++       * button.
++       *
++       * AddBlockForDrop() adds the block only after the wait. To decide, the
++       * target stats the files it was offered, and with a block in place that
++       * stat does not return. When the placeholders could not be staged,
++       * OnSrcDragBegin() added the block already, and this wait runs out.
++       */
++      if (!WaylandDrag_WaitForAccept(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS)) {
++         /*
++          * A file manager fetches the offer's contents and decides only on a
++          * motion that comes after they arrive. When the pointer has already
++          * stopped, no such motion comes, so move the pointer one pixel and
++          * back.
++          */
++         g_debug("%s: nudging the pointer for an answer\n", __FUNCTION__);
++         NudgeWaylandDrag(this);
++         if (!WaylandDrag_WaitForAccept(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS)) {
++            /*
++             * A target that still refuses may be judging this drag on the
++             * contents of an earlier one, as WaylandDrag_Refocus()
++             * describes. Make it see the drag leave and come back.
++             */
++            g_debug("%s: taking the drag off the target and back\n",
++                    __FUNCTION__);
++            WaylandDrag_Refocus(WAYLAND_DRAG_ACCEPT_TIMEOUT_MS,
++                                NudgeWaylandDrag, this);
++         }
++      }
+       AddBlockForDrop();
+       FakeMouse_Click(false);
+       mHGButtonDown = false;
+diff --git a/services/plugins/dndcp/waylandDrag/waylandDrag.c b/services/plugins/dndcp/waylandDrag/waylandDrag.c
+index 8f1c3f7..285df99 100644
+--- a/services/plugins/dndcp/waylandDrag/waylandDrag.c
++++ b/services/plugins/dndcp/waylandDrag/waylandDrag.c
+@@ -72,10 +72,10 @@
+ #define WAYLAND_DRAG_SEND_BUDGET_US (4 * G_USEC_PER_SEC)
+ 
+ /*
+- * How long this module waits for the compositor in WaylandDrag_Init() and
+- * WaylandDrag_Arm(). These waits run on the plugin's main loop, which also
+- * carries the RPC channel, and a compositor that has stopped answering must
+- * not stall it.
++ * How long this module waits for the compositor in WaylandDrag_Init(),
++ * WaylandDrag_Arm() and the shield phase of WaylandDrag_Refocus(). These
++ * waits run on the plugin's main loop, which also carries the RPC channel,
++ * and a compositor that has stopped answering must not stall it.
+  */
+ #define WAYLAND_DRAG_REPLY_TIMEOUT_MS 500
+ 
+@@ -94,6 +94,19 @@
+  */
+ #define WAYLAND_DRAG_FINISH_TIMEOUT_S 10
+ 
++/*
++ * How long an accept has to remain the target's latest answer before the
++ * button is released on it.
++ */
++#define WAYLAND_DRAG_QUIET_MS 30
++
++/*
++ * How long WaylandDrag_Refocus() gives the target to fetch the new offer
++ * before moving the pointer again so it decides on it.
++ */
++#define WAYLAND_DRAG_REFOCUS_SETTLE_MS 150
++
++
+ typedef struct {
+    char *mimeType;
+    void *data;
+@@ -108,6 +121,8 @@ typedef struct {
+    struct wl_buffer *buffer;
+    int width;
+    int height;
++   /* A shield from WaylandDrag_Refocus(), mapped even while gDrag.hidden. */
++   gboolean shield;
+ } DragOverlay;
+ 
+ static struct {
+@@ -123,9 +138,19 @@ static struct {
+ 
+    DragOverlay overlays[WAYLAND_DRAG_MAX_OUTPUTS];
+    size_t nOverlays;
++   /* Short-lived overlays that take the drag off a target, for Refocus. */
++   DragOverlay shields[WAYLAND_DRAG_MAX_OUTPUTS];
++   size_t nShields;
+    gboolean mapped;
+    /* The overlays were unmapped for the drag. A configure must not remap. */
+    gboolean hidden;
++   /*
++    * Counts configures that mapped an overlay, so WaylandDrag_Refocus() can
++    * tell when its shields are mapped.
++    */
++   unsigned int configures;
++   /* The drag is over the overlay rather than over a target. */
++   gboolean overlayEntered;
+ 
+    /*
+     * The surface the pointer is over. A press can come only from that
+@@ -667,9 +692,10 @@ OfferDestroy(struct wl_data_offer *offer)   // IN/OPT
+  *    The compositor must stop offering the drag to the overlay as soon as
+  *    HideOverlays() runs. These data device events are the only way to see
+  *    that, because the rest of this module sees only the source's side of
+- *    the drag. An enter that is not followed straight away by a leave, or any
+- *    drop here, means the overlay is taking the drop away from the
+- *    application under it.
++ *    the drag. Outside WaylandDrag_Refocus(), an enter that is not followed
++ *    straight away by a leave, or any drop here, means the overlay is taking
++ *    the drop away from the application under it. WaylandDrag_Refocus()
++ *    waits for the enter on a shield.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -698,6 +724,7 @@ DeviceEnter(void *d,                     // IN: unused
+             struct wl_data_offer *o)     // IN: unused
+ {
+    DragIsReal();
++   gDrag.overlayEntered = TRUE;
+    g_debug("%s: the overlay was offered the drag\n", __FUNCTION__);
+ }
+ 
+@@ -706,6 +733,7 @@ DeviceLeave(void *d,                    // IN: unused
+             struct wl_data_device *dd)  // IN: unused
+ {
+    g_debug("%s: the drag left the overlay\n", __FUNCTION__);
++   gDrag.overlayEntered = FALSE;
+    OfferDestroy(gDrag.offer);
+    gDrag.offer = NULL;
+ }
+@@ -846,9 +874,10 @@ MakeOverlay(DragOverlay *o)   // IN/OUT: output set, the rest empty
+ /*
+  *-----------------------------------------------------------------------------
+  *
+- * DestroyOverlay --
++ * DestroyOverlay, DestroyShields --
+  *
+- *    Destroy an overlay's objects, keeping its output.
++ *    Destroy an overlay's objects, keeping its output. DestroyShields() does
++ *    it for every shield and forgets them.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -870,12 +899,26 @@ DestroyOverlay(DragOverlay *o)   // IN/OUT
+    }
+ }
+ 
++static void
++DestroyShields(void)
++{
++   size_t i;
++
++   for (i = 0; i < gDrag.nShields; i++) {
++      DestroyOverlay(&gDrag.shields[i]);
++   }
++   memset(gDrag.shields, 0, sizeof gDrag.shields);
++   gDrag.nShields = 0;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+  * Unmap --
+  *
+- *    Destroy the overlays. The connection and the bound globals stay.
++ *    Destroy the overlays and the shields. The connection and the bound
++ *    globals stay.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -888,9 +931,11 @@ Unmap(void)
+    for (i = 0; i < gDrag.nOverlays; i++) {
+       DestroyOverlay(&gDrag.overlays[i]);
+    }
++   DestroyShields();
+    gDrag.focus = NULL;
+    gDrag.mapped = FALSE;
+    gDrag.hidden = FALSE;
++   gDrag.overlayEntered = FALSE;
+    if (gDrag.display != NULL) {
+       wl_display_flush(gDrag.display);
+    }
+@@ -1025,6 +1070,12 @@ PointerButton(void *data,                 // IN: unused
+                                  WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    }
+ 
++   /*
++    * Otherwise the previous drag's last answer would count for this drag
++    * until the new target answers, WaylandDrag_WaitForAccept() would return
++    * TRUE on it, and the caller would release the button.
++    */
++   gDrag.accepted = FALSE;
+    gDrag.sendBudgetUs = WAYLAND_DRAG_SEND_BUDGET_US;
+ 
+    /* No drag icon. The host draws one on its side of the window. */
+@@ -1226,7 +1277,7 @@ LayerSurfaceConfigure(void *data,                             // IN: DragOverlay
+     * put the overlay back over the cursor in the middle of the drag, undoing
+     * what HideOverlays() just did.
+     */
+-   if (gDrag.hidden) {
++   if (gDrag.hidden && !o->shield) {
+       g_debug("%s: configure %ux%u while hidden, staying unmapped\n",
+               __FUNCTION__, width, height);
+       return;
+@@ -1253,6 +1304,7 @@ LayerSurfaceConfigure(void *data,                             // IN: DragOverlay
+    wl_surface_damage(o->surface, 0, 0, o->width, o->height);
+    wl_surface_commit(o->surface);
+    gDrag.mapped = TRUE;
++   gDrag.configures++;
+ }
+ 
+ 
+@@ -1337,6 +1389,8 @@ RegistryGlobalRemove(void *data,                   // IN: unused
+       if (o->output == NULL || o->name != name) {
+          continue;
+       }
++      /* Shields share the overlays' outputs. */
++      DestroyShields();
+       if (o->layer != NULL) {
+          zwlr_layer_surface_v1_destroy(o->layer);
+       }
+@@ -1829,6 +1883,89 @@ lost:
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * WaylandDrag_WaitForAccept --
++ *
++ *    Wait until the deadline for the target to say it will take the drop.
++ *
++ *    The compositor decides the drop on the last answer the target sent, and
++ *    a file manager answers each pointer motion with an accept followed by
++ *    two refusals. The host moves the pointer much faster than a file manager
++ *    keeps up. When the host stops and releases, the last answer is whatever
++ *    part of that backlog the target had reached. About a third of the time
++ *    it is a refusal, and the drop is discarded. The pointer has stopped, so
++ *    nothing prompts the target again, and the release has to wait here.
++ *
++ * Results:
++ *    True if the target is willing, false if it refused or ran out of time.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++WaylandDrag_WaitForAccept(unsigned int timeoutMs)   // IN
++{
++   gint64 started = g_get_monotonic_time();
++   gint64 deadline = started + (gint64) timeoutMs * 1000;
++
++   if (!gDrag.inited || !gDrag.dragging) {
++      return FALSE;
++   }
++
++   while (gDrag.dragging) {
++      int left;
++      int r;
++
++      /*
++       * The answer already received may be the start of a burst the target
++       * sent while the pointer was still moving. Releasing on that accept
++       * loses the drop to the refusals behind it. A round trip dispatches
++       * everything the compositor has already sent, so the answer after it
++       * is the one the drop will be decided on. The round trip uses the same
++       * deadline as the rest of the wait.
++       */
++      r = SyncUntil(deadline);
++      if (r < 0) {
++         return FALSE;
++      }
++      if (r == 0 || !gDrag.dragging) {
++         break;
++      }
++
++      left = (int) ((deadline - g_get_monotonic_time()) / 1000);
++      if (left <= 0) {
++         break;
++      }
++      if (gDrag.accepted) {
++         /*
++          * A target that has fallen behind the pointer is still answering
++          * motions from before the pointer stopped. The refusal behind an
++          * accept can then arrive in the time the button release takes to
++          * go through uinput and the compositor. Release only on an accept
++          * that is still current after a pause.
++          */
++         left = MIN(left, WAYLAND_DRAG_QUIET_MS);
++      }
++      r = ReadOnce(left, NULL);
++      if (r < 0) {
++         return FALSE;
++      }
++      if (r == 0 && gDrag.accepted) {
++         /* Nothing arrived in the pause, so the accept is current. */
++         break;
++      }
++   }
++
++   g_debug("%s: target %s after %" G_GINT64_FORMAT "ms\n", __FUNCTION__,
++           gDrag.accepted ? "is willing" : "never agreed",
++           (g_get_monotonic_time() - started) / 1000);
++
++   return gDrag.accepted;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -1861,6 +1998,127 @@ WaylandDrag_Pump(void)
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * WaylandDrag_Refocus --
++ *
++ *    Move the drag off the target and back, then wait for its answer.
++ *
++ *    A target can carry state from one drag into the next. Thunar asks for
++ *    the URI list on the first motion it handles. When the pointer crosses
++ *    its window faster than Thunar keeps up, Thunar handles that motion after
++ *    the leave. It keeps the list that comes back and judges the next drag
++ *    over its window by that list, which names files an earlier drag staged
++ *    and that are gone by then. It refuses on every motion without asking
++ *    for the new offer, and only another leave clears that.
++ *
++ *    So map a fresh overlay, a shield, on each output and nudge the pointer,
++ *    and the compositor moves the drag onto the shield. Then destroy the
++ *    shields and nudge again, and the compositor enters the target afresh
++ *    with the new offer.
++ *
++ *    The overlay the drag started from cannot be used for this. It was
++ *    unmapped for the drag, and an unmapped layer surface returns to the
++ *    unconfigured state, in which KWin never configures it again.
++ *
++ * Results:
++ *    True if the target is willing, false otherwise.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++WaylandDrag_Refocus(unsigned int timeoutMs,        // IN
++                    WaylandDragNudgeFunc nudge,    // IN
++                    void *clientData)              // IN
++{
++   gint64 deadline;
++   unsigned int configuresBefore;
++   size_t i;
++   int r;
++
++   if (!gDrag.inited || !gDrag.dragging || nudge == NULL ||
++       gDrag.nShields != 0) {
++      return FALSE;
++   }
++
++   deadline = g_get_monotonic_time() +
++              (gint64) WAYLAND_DRAG_REPLY_TIMEOUT_MS * 1000;
++   configuresBefore = gDrag.configures;
++   for (i = 0; i < gDrag.nOverlays; i++) {
++      if (gDrag.overlays[i].output != NULL) {
++         DragOverlay *o = &gDrag.shields[gDrag.nShields++];
++
++         o->output = gDrag.overlays[i].output;
++         o->shield = TRUE;
++         MakeOverlay(o);
++      }
++   }
++   while (gDrag.dragging &&
++          gDrag.configures - configuresBefore < gDrag.nShields) {
++      int left = (int) ((deadline - g_get_monotonic_time()) / 1000);
++
++      if (left <= 0) {
++         break;
++      }
++      r = ReadOnce(left, NULL);
++      if (r < 0) {
++         return FALSE;
++      }
++   }
++   if (gDrag.configures == configuresBefore) {
++      g_debug("%s: no shield was configured\n", __FUNCTION__);
++      DestroyShields();
++      return FALSE;
++   }
++   r = SyncUntil(deadline);
++   if (r < 0) {
++      return FALSE;
++   }
++   if (!gDrag.dragging) {
++      DestroyShields();
++      return FALSE;
++   }
++
++   nudge(clientData);
++   while (gDrag.dragging && !gDrag.overlayEntered) {
++      int left = (int) ((deadline - g_get_monotonic_time()) / 1000);
++
++      if (left <= 0) {
++         break;
++      }
++      r = ReadOnce(left, &gDrag.overlayEntered);
++      if (r < 0) {
++         return FALSE;
++      }
++   }
++   g_debug("%s: %s\n", __FUNCTION__, gDrag.overlayEntered ?
++           "the target let go of the drag" : "the shield never got the drag");
++
++   DestroyShields();
++   gDrag.accepted = FALSE;
++   r = SyncUntil(deadline);
++   if (r < 0 || !gDrag.dragging) {
++      return FALSE;
++   }
++   nudge(clientData);
++
++   /*
++    * The new enter makes the target ask for the offer's contents, but the
++    * target decides only on a motion that comes after they arrive, and the
++    * last nudge came before. Nudge again if it has not accepted.
++    */
++   if (WaylandDrag_WaitForAccept(WAYLAND_DRAG_REFOCUS_SETTLE_MS) ||
++       !gDrag.dragging) {
++      return gDrag.accepted;
++   }
++   nudge(clientData);
++
++   return WaylandDrag_WaitForAccept(timeoutMs);
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+diff --git a/services/plugins/dndcp/waylandDrag/waylandDrag.h b/services/plugins/dndcp/waylandDrag/waylandDrag.h
+index a81263f..455a90d 100644
+--- a/services/plugins/dndcp/waylandDrag/waylandDrag.h
++++ b/services/plugins/dndcp/waylandDrag/waylandDrag.h
+@@ -95,6 +95,24 @@ gboolean WaylandDrag_StartOnPress(unsigned int timeoutMs,
+ /* Handle what the compositor has sent so far, without waiting. */
+ void WaylandDrag_Pump(void);
+ 
++/* Wait until the target will take the drop, or until timeoutMs has passed. */
++gboolean WaylandDrag_WaitForAccept(unsigned int timeoutMs);
++
++/*
++ * Move the pointer one pixel away and back. The compositor checks what is
++ * under the cursor again only on pointer motion.
++ */
++typedef void (*WaylandDragNudgeFunc)(void *clientData);
++
++/*
++ * Make the target see the drag leave and come back, then wait for it as
++ * WaylandDrag_WaitForAccept() does. This is for a target that is still
++ * judging the drag on the contents of an earlier one.
++ */
++gboolean WaylandDrag_Refocus(unsigned int timeoutMs,
++                             WaylandDragNudgeFunc nudge,
++                             void *clientData);
++
+ /* Discard an armed drag that never started. done() is not called. */
+ void WaylandDrag_Disarm(void);
+ 
+diff --git a/services/plugins/dndcp/waylandDrag/waylandDragStub.c b/services/plugins/dndcp/waylandDrag/waylandDragStub.c
+index b7a9b26..090c916 100644
+--- a/services/plugins/dndcp/waylandDrag/waylandDragStub.c
++++ b/services/plugins/dndcp/waylandDrag/waylandDragStub.c
+@@ -69,6 +69,22 @@ WaylandDrag_Pump(void)
+ }
+ 
+ 
++gboolean
++WaylandDrag_WaitForAccept(unsigned int timeoutMs)   // IN: unused
++{
++   return FALSE;
++}
++
++
++gboolean
++WaylandDrag_Refocus(unsigned int timeoutMs,        // IN: unused
++                    WaylandDragNudgeFunc nudge,    // IN: unused
++                    void *clientData)              // IN: unused
++{
++   return FALSE;
++}
++
++
+ void
+ WaylandDrag_Disarm(void)
+ {
+-- 
+2.55.0
+

@@ -1,0 +1,636 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:10 -0700
+Subject: [PATCH 09/21] dndcp: Fall back to wl-clipboard without
+ ext-data-control-v1
+
+GNOME does not implement ext-data-control-v1. Where the compositor lacks
+it, the backend now runs wl-copy to install a host clip and wl-paste to
+read the guest selection.
+
+wl-copy serves one payload under one type. The backend gives it the
+image if the host sent one, else the plain text, and the RTF only when
+there is nothing else, because handing plain text targets the RTF markup
+would be worse than losing the formatting. wl-paste picks a text type
+itself, so reading text takes one run instead of a type listing and a
+read.
+
+The tools run under the same limits as the data control reads. wl-paste
+output is polled against the request's deadline and stops at
+CPCLIPITEM_MAX_SIZE_V3. wl-copy gets 5 s to install a clip. Each tool
+runs in a process group of its own, so that a timeout kills it together
+with the process it forked. Nothing counts selection changes on this
+path, so every host request reads the selection.
+
+On GNOME both tools map a small window to be given focus. The window
+shows in the dock and takes the focus for a moment, and wl-copy waits
+for that focus before it installs the selection. The next patch uses the
+X selection instead where there is an X display. Without wl-copy, a
+warning at start-up says that host to guest copy and paste is off.
+---
+ services/plugins/dndcp/copyPasteUIWayland.cpp | 409 +++++++++++++++++-
+ services/plugins/dndcp/copyPasteUIWayland.h   |   5 +-
+ .../dndcp/dndGuestBase/copyPasteDnDWayland.h  |   6 +-
+ .../dndcp/waylandClipboard/waylandClipboard.c |  12 +-
+ .../dndcp/waylandClipboard/waylandClipboard.h |   5 +-
+ 5 files changed, 413 insertions(+), 24 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+index 29e96f5..af8d4f1 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.cpp
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp
+@@ -22,15 +22,22 @@
+  * Wayland implementation of host<->guest copy/paste, derived from
+  * copyPasteUIX11.cpp. Rather than owning an X selection through GtkClipboard,
+  * the local selection is owned and read through ext-data-control-v1 in
+- * waylandClipboard.c. A data control client needs no keyboard focus, unlike
+- * the core wl_data_device protocol that GtkClipboard uses on Wayland. That is
+- * what allows a background daemon to bridge the clipboard.
++ * waylandClipboard.c. Where the compositor does not implement it, wl-copy
++ * and wl-paste are used. A data control client needs no keyboard focus,
++ * unlike the core wl_data_device protocol that GtkClipboard uses on Wayland.
++ * That is what allows a background daemon to bridge the clipboard.
+  */
+ 
+ #define G_LOG_DOMAIN "dndcp"
+ 
+ #include <glib.h>
++#include <glib-unix.h>
++#include <errno.h>
++#include <signal.h>
+ #include <string.h>
++#include <sys/poll.h>
++#include <sys/wait.h>
++#include <unistd.h>
+ 
+ #include "vmware.h"
+ #include "copyPasteUIWayland.h"
+@@ -54,6 +61,21 @@ extern "C" {
+  */
+ #define CP_REQUEST_BUDGET_MS 2000
+ 
++/*
++ * How long to wait for wl-copy to install a host clip. On GNOME wl-copy
++ * installs the selection only once its window has the focus. The wait runs
++ * on the main loop, so it has to end, but a slow install must not be
++ * dropped.
++ */
++#define CP_WLCOPY_TIMEOUT_MS 5000
++
++/*
++ * False once CopyPasteUIWayland::Init() has found that wl-copy is not
++ * installed, so that the fallback does not try to run it for every host clip.
++ */
++static bool gHaveWlCopy = true;
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -79,6 +101,291 @@ CopyPasteWaylandRemainingMs(gint64 deadline)   // IN: monotonic, microseconds
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandChildSetup --
++ *
++ *    Runs in the forked child before exec. wl-paste forks a helper of its own
++ *    to copy the data, and wl-copy forks the process that serves the
++ *    selection. A timeout has to kill both processes of the pair. A process
++ *    group of their own lets one kill() reach them.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++CopyPasteWaylandChildSetup(gpointer data)  // IN: unused
++{
++   setpgid(0, 0);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandSetData --
++ *
++ *    Install data of type mimeType as the local Wayland selection through
++ *    wl-copy.
++ *
++ *    Spawn wl-copy and feed the bytes to its stdin. wl-copy reads stdin
++ *    until EOF, installs the selection, then forks a resident process to
++ *    serve it and exits. Wait for that exit so that a later clipboard read
++ *    cannot race the selection update. The spawn inherits the environment so
++ *    wl-copy sees WAYLAND_DISPLAY and XDG_RUNTIME_DIR.
++ *
++ *    On GNOME, wl-copy maps a window and waits for it to be given the focus,
++ *    which may never happen, for example behind the lock screen. The wait
++ *    runs on the main loop that also carries the RPC channel, so it ends
++ *    after CP_WLCOPY_TIMEOUT_MS, and wl-copy is killed then.
++ *
++ * Results:
++ *    true if the selection was installed.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandSetData(const gchar *mimeType,  // IN
++                        const char *data,       // IN
++                        gsize len)              // IN
++{
++   const gchar *argv[] = { "wl-copy", "--type", mimeType, NULL };
++
++   if (!gHaveWlCopy) {
++      g_debug("%s: wl-copy is not installed\n", __FUNCTION__);
++      return false;
++   }
++
++   gint64 deadline = g_get_monotonic_time() + CP_WLCOPY_TIMEOUT_MS * 1000;
++   GPid pid = 0;
++   gint stdinFd = -1;
++   GError *err = NULL;
++   gsize off = 0;
++
++   if (!g_spawn_async_with_pipes(NULL, (gchar **) argv, NULL,
++            (GSpawnFlags) (G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD),
++            CopyPasteWaylandChildSetup, NULL,
++            &pid, &stdinFd, NULL, NULL, &err)) {
++      g_warning("%s: failed to spawn wl-copy: %s\n", __FUNCTION__,
++                err != NULL ? err->message : "unknown error");
++      g_clear_error(&err);
++      return false;
++   }
++
++   bool success = true;
++   while (off < len) {
++      ssize_t written = write(stdinFd, data + off, len - off);
++      if (written < 0) {
++         if (errno == EINTR) {
++            continue;
++         }
++         g_warning("%s: write to wl-copy failed: %s\n", __FUNCTION__,
++                   g_strerror(errno));
++         success = false;
++         break;
++      }
++      off += (gsize) written;
++   }
++
++   /* Closing stdin is the EOF that lets wl-copy install the selection. */
++   close(stdinFd);
++
++   /* Wait for wl-copy to install the selection before it can be reread. */
++   gint status = 0;
++   pid_t waited;
++   for (;;) {
++      waited = waitpid(pid, &status, WNOHANG);
++      if (waited == pid) {
++         break;
++      }
++      if (waited < 0) {
++         if (errno == EINTR) {
++            continue;
++         }
++         g_warning("%s: wait for wl-copy failed: %s\n", __FUNCTION__,
++                   g_strerror(errno));
++         break;
++      }
++      if (CopyPasteWaylandRemainingMs(deadline) == 0) {
++         g_warning("%s: wl-copy did not install the selection in %d ms\n",
++                   __FUNCTION__, CP_WLCOPY_TIMEOUT_MS);
++         kill(-pid, SIGKILL);
++         kill(pid, SIGKILL);
++         do {
++            waited = waitpid(pid, &status, 0);
++         } while (waited < 0 && errno == EINTR);
++         success = false;
++         break;
++      }
++      g_usleep(1000);
++   }
++   g_spawn_close_pid(pid);
++
++   return success && waited == pid &&
++          WIFEXITED(status) && WEXITSTATUS(status) == 0;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandRunPaste --
++ *
++ *    Run wl-paste and collect its stdout within the request deadline and the
++ *    V3 size ceiling.
++ *
++ *    The data comes from whichever client owns the selection, through
++ *    wl-paste, at that client's pace. This runs on the main loop that also
++ *    carries the RPC channel, so an owner that never writes, or never stops
++ *    writing, must not hold it. The pipe is polled against the deadline, and
++ *    wl-paste is killed at the deadline or at the ceiling.
++ *
++ * Results:
++ *    A NUL terminated buffer, to be freed with g_free(), holding *outLen
++ *    bytes before the terminator. NULL when wl-paste failed, exited non-zero,
++ *    ran out of time or produced too much. wl-paste exits non-zero for an
++ *    empty clipboard.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static guchar *
++CopyPasteWaylandRunPaste(const gchar *const *argv,  // IN
++                         gint64 deadline,           // IN: monotonic, us
++                         gsize *outLen)             // OUT
++{
++   GPid pid = 0;
++   gint stdoutFd = -1;
++   GError *err = NULL;
++   GByteArray *acc;
++   guchar chunk[65536];
++   gint status = 0;
++   pid_t waited;
++   bool complete = false;
++
++   *outLen = 0;
++
++   if (!g_spawn_async_with_pipes(NULL, (gchar **) argv, NULL,
++            (GSpawnFlags) (G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD),
++            CopyPasteWaylandChildSetup, NULL,
++            &pid, NULL, &stdoutFd, NULL, &err)) {
++      g_debug("%s: failed to spawn wl-paste: %s\n", __FUNCTION__,
++              err != NULL ? err->message : "unknown error");
++      g_clear_error(&err);
++      return NULL;
++   }
++
++   if (!g_unix_set_fd_nonblocking(stdoutFd, TRUE, NULL)) {
++      g_debug("%s: could not make the pipe non-blocking\n", __FUNCTION__);
++   }
++
++   acc = g_byte_array_new();
++
++   for (;;) {
++      ssize_t got = read(stdoutFd, chunk, sizeof chunk);
++
++      if (got > 0) {
++         /* The host refuses anything past the ceiling, so stop there. */
++         if ((gsize) acc->len + (gsize) got > (gsize) CPCLIPITEM_MAX_SIZE_V3) {
++            g_debug("%s: %s output exceeds the V3 limit, dropping\n",
++                    __FUNCTION__, argv[0]);
++            break;
++         }
++         g_byte_array_append(acc, chunk, (guint) got);
++         continue;
++      }
++      if (got == 0) {
++         complete = true;
++         break;
++      }
++      if (errno == EINTR) {
++         continue;
++      }
++      if (errno != EAGAIN) {
++         g_warning("%s: read from %s failed: %s\n", __FUNCTION__, argv[0],
++                   g_strerror(errno));
++         break;
++      }
++
++      unsigned int left = CopyPasteWaylandRemainingMs(deadline);
++      if (left == 0) {
++         g_debug("%s: %s did not finish in time\n", __FUNCTION__, argv[0]);
++         break;
++      }
++
++      struct pollfd pfd;
++      pfd.fd = stdoutFd;
++      pfd.events = POLLIN;
++      pfd.revents = 0;
++      poll(&pfd, 1, (int) MIN(left, (unsigned int) G_MAXINT));
++   }
++
++   close(stdoutFd);
++
++   /* SIGKILL, because the child may be blocked on a pipe either way. */
++   if (!complete) {
++      kill(-pid, SIGKILL);
++      kill(pid, SIGKILL);
++   }
++
++   /*
++    * A closed stdout normally means wl-paste is exiting. Wait for it only
++    * until the deadline.
++    */
++   for (;;) {
++      waited = waitpid(pid, &status, complete ? WNOHANG : 0);
++      if (waited == pid) {
++         break;
++      }
++      if (waited < 0) {
++         if (errno == EINTR) {
++            continue;
++         }
++         break;
++      }
++      if (CopyPasteWaylandRemainingMs(deadline) == 0) {
++         g_debug("%s: %s did not exit in time\n", __FUNCTION__, argv[0]);
++         complete = false;
++         kill(-pid, SIGKILL);
++         kill(pid, SIGKILL);
++         continue;
++      }
++      g_usleep(1000);
++   }
++   g_spawn_close_pid(pid);
++
++   if (!complete || waited != pid ||
++       !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++      g_byte_array_free(acc, TRUE);
++      return NULL;
++   }
++
++   *outLen = (gsize) acc->len;
++   g_byte_array_append(acc, (const guint8 *) "", 1);
++   return g_byte_array_free(acc, FALSE);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandSetText --
++ *
++ *    Install plain UTF-8 text as the local selection.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandSetText(const char *data,  // IN
++                        gsize len)         // IN
++{
++   return CopyPasteWaylandSetData("text/plain;charset=utf-8", data, len);
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -97,7 +404,27 @@ CopyPasteWaylandHasType(const gchar *mimeType,  // IN
+    if (WaylandClipboard_IsAvailable()) {
+       return WaylandClipboard_HasType(mimeType);
+    }
+-   return false;
++
++   const gchar *argv[] = { "wl-paste", "--list-types", NULL };
++   gsize len = 0;
++   gchar *out = (gchar *) CopyPasteWaylandRunPaste(argv, deadline, &len);
++   bool found = false;
++
++   if (out != NULL) {
++      gchar **lines = g_strsplit(out, "\n", -1);
++      guint i;
++
++      for (i = 0; lines[i] != NULL; i++) {
++         if (g_ascii_strcasecmp(g_strstrip(lines[i]), mimeType) == 0) {
++            found = true;
++            break;
++         }
++      }
++      g_strfreev(lines);
++   }
++
++   g_free(out);
++   return found;
+ }
+ 
+ 
+@@ -129,10 +456,16 @@ CopyPasteWaylandGetData(const gchar *mimeType,  // IN
+       return (guchar *) d;
+    }
+ 
+-   if (outLen != NULL) {
+-      *outLen = 0;
++   const gchar *argv[] = {
++      "wl-paste", "--no-newline", "--type", mimeType, NULL
++   };
++   guchar *data = CopyPasteWaylandRunPaste(argv, deadline, outLen);
++
++   if (data != NULL && *outLen == 0) {
++      g_free(data);
++      data = NULL;
+    }
+-   return NULL;
++   return data;
+ }
+ 
+ 
+@@ -159,6 +492,17 @@ CopyPasteWaylandGetText(gsize *outLen,   // OUT
+ 
+    *outLen = 0;
+ 
++   if (!WaylandClipboard_IsAvailable()) {
++      /*
++       * wl-paste picks a text type itself. One run instead of a type
++       * listing and a read also maps its window only once on GNOME.
++       * wl-paste exits non-zero when the clipboard is empty.
++       */
++      const gchar *argv[] = { "wl-paste", "--no-newline", NULL };
++
++      return (gchar *) CopyPasteWaylandRunPaste(argv, deadline, outLen);
++   }
++
+    for (int i = 0; types[i] != NULL; i++) {
+       gsize n = 0;
+       guchar *d;
+@@ -242,13 +586,24 @@ CopyPasteUIWayland::Init()
+ 
+    /*
+     * Own the selection directly when the compositor implements
+-    * ext-data-control-v1. This has to happen before the baseline read below.
++    * ext-data-control-v1. Otherwise, which is the case on GNOME, fall back to
++    * wl-clipboard.
++    *
++    * This has to happen before the baseline read below, or that read goes
++    * through wl-paste even when the native path is the one in use.
+     */
+    if (WaylandClipboard_Init()) {
+       g_debug("%s: using the native Wayland selection\n", __FUNCTION__);
+    } else {
+-      g_warning("%s: the compositor does not offer ext-data-control-v1, "
+-                "copy and paste is disabled\n", __FUNCTION__);
++      gchar *wlCopy = g_find_program_in_path("wl-copy");
++
++      g_debug("%s: ext-data-control-v1 unavailable, using the fallback\n",
++              __FUNCTION__);
++      gHaveWlCopy = wlCopy != NULL;
++      if (!gHaveWlCopy) {
++         g_debug("%s: wl-copy is not installed\n", __FUNCTION__);
++      }
++      g_free(wlCopy);
+    }
+ 
+    /*
+@@ -263,6 +618,13 @@ CopyPasteUIWayland::Init()
+    mLastClipboardText.assign(text != NULL ? text : "", len);
+    g_free(text);
+ 
++   if (!gHaveWlCopy) {
++      g_warning("%s: the compositor does not offer ext-data-control-v1 and "
++                "wl-copy is not installed. Host to guest copy and paste is "
++                "disabled. Install wl-clipboard to enable it.\n",
++                __FUNCTION__);
++   }
++
+    mCP->srcRecvClipChanged.connect(
+       sigc::mem_fun(this, &CopyPasteUIWayland::GetRemoteClipboardCB));
+    mCP->destRequestClipChanged.connect(
+@@ -358,7 +720,8 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+     * Offer every format the host sent in one selection, so an application
+     * asking for rich text gets RTF while one asking for plain text gets the
+     * text rendering. The X11 backend offers text and RTF together the same
+-    * way.
++    * way. wl-copy serves a single payload, so the last fallback below picks
++    * one.
+     */
+    std::vector<WaylandClipItem> items;
+    void *rtfBuf = NULL;
+@@ -405,9 +768,28 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+    g_debug("%s: offering %d formats locally\n", __FUNCTION__,
+            (int) items.size());
+ 
+-   bool ok = false;
++   bool ok;
+    if (WaylandClipboard_IsAvailable()) {
+       ok = WaylandClipboard_Offer(&items[0], items.size());
++   } else {
++      /*
++       * wl-copy serves one payload. Prefer an image, then plain text, and
++       * use RTF only when there is nothing else. Handing plain text targets
++       * the RTF markup would be worse than losing the formatting. Only the
++       * chosen format is recorded below.
++       */
++      if (haveImg) {
++         ok = CopyPasteWaylandSetData("image/png", (const char *) imgBuf,
++                                      (gsize) imgSz);
++         haveRtf = false;
++         text = NULL;
++      } else if (text != NULL) {
++         ok = CopyPasteWaylandSetText(text, textLen);
++         haveRtf = false;
++      } else {
++         ok = CopyPasteWaylandSetData(TARGET_NAME_TEXT_RTF,
++                                      (const char *) rtfBuf, (gsize) rtfSz);
++      }
+    }
+ 
+    if (!ok) {
+@@ -499,7 +881,8 @@ CopyPasteUIWayland::GetLocalClipboard(void)
+    /*
+     * When this client owns the selection, the selection holds what the host
+     * sent, so there is nothing new to report. Reading it back would send the
+-    * host its own data.
++    * host its own data. A selection installed through wl-copy belongs to
++    * wl-copy, and the content comparisons below catch it.
+     */
+    if (WaylandClipboard_IsOwner()) {
+       g_debug("%s: we own the local selection, nothing new for the host\n",
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.h b/services/plugins/dndcp/copyPasteUIWayland.h
+index e9e3b32..602891b 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.h
++++ b/services/plugins/dndcp/copyPasteUIWayland.h
+@@ -21,8 +21,9 @@
+  *
+  * This class implements host<->guest copy/paste (version 3+ of the protocol)
+  * for Wayland sessions. The local selection is owned and read through
+- * ext-data-control-v1 where the compositor implements it. This is the
+- * counterpart of copyPasteUIX11.h for the Wayland platform.
++ * ext-data-control-v1 where the compositor implements it. Elsewhere, wl-copy
++ * installs it and wl-paste reads it. This is the counterpart of
++ * copyPasteUIX11.h for the Wayland platform.
+  *
+  * Text, RTF and PNG images are supported.
+  */
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+index fc6f211..9d89ebc 100644
+--- a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+@@ -21,9 +21,9 @@
+  *
+  * Concrete CopyPasteDnDImpl for Wayland sessions. Copy and paste is driven
+  * by CopyPasteUIWayland, which owns the Wayland selection through
+- * ext-data-control-v1. Drag and drop is delegated to DnDUIX11, which runs its
+- * detection window under Xwayland. The RPC transport runs on the toolbox
+- * GLib main loop.
++ * ext-data-control-v1, or else through wl-copy. Drag and drop is delegated to
++ * DnDUIX11, which runs its detection window under Xwayland. The RPC
++ * transport runs on the toolbox GLib main loop.
+  */
+ 
+ #ifndef __COPYPASTEDNDWAYLAND_H__
+diff --git a/services/plugins/dndcp/waylandClipboard/waylandClipboard.c b/services/plugins/dndcp/waylandClipboard/waylandClipboard.c
+index b309d30..0fe9695 100644
+--- a/services/plugins/dndcp/waylandClipboard/waylandClipboard.c
++++ b/services/plugins/dndcp/waylandClipboard/waylandClipboard.c
+@@ -46,7 +46,8 @@
+ 
+ /*
+  * The host accepts nothing larger than CPCLIPITEM_MAX_SIZE_V3 from
+- * dndClipboard.h, so a larger selection is not worth buffering.
++ * dndClipboard.h, so a larger selection is not worth buffering. The
++ * wl-clipboard fallback in copyPasteUIWayland.cpp stops at the same limit.
+  */
+ #include "dndClipboard.h"
+ 
+@@ -405,7 +406,8 @@ DevicePrimarySelection(void *data,                                // IN: unused
+  * DeviceFinished --
+  *
+  *    The compositor has finished with the device, and any further request on
+- *    it is a protocol error. Destroy it and mark the module unavailable.
++ *    it is a protocol error. Destroy it and mark the module unavailable, so
++ *    the callers fall back to wl-clipboard.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -473,7 +475,8 @@ static const struct wl_registry_listener gRegistryListener = {
+  *
+  * Side effects:
+  *    A dead display shuts the module down. IsAvailable() then returns FALSE,
+- *    and the callers stop using a connection that will never answer.
++ *    and the callers use wl-clipboard instead of a connection that will
++ *    never answer.
+  *
+  *-----------------------------------------------------------------------------
+  */
+@@ -514,7 +517,8 @@ DisplayReadable(gint fd,             // IN: unused
+  *    watch the connection from the GLib main loop.
+  *
+  * Results:
+- *    TRUE when the protocol is available, FALSE otherwise.
++ *    TRUE when the protocol is available. FALSE otherwise, and the caller
++ *    then falls back to wl-clipboard.
+  *
+  *-----------------------------------------------------------------------------
+  */
+diff --git a/services/plugins/dndcp/waylandClipboard/waylandClipboard.h b/services/plugins/dndcp/waylandClipboard/waylandClipboard.h
+index 3fd8d7b..2628d78 100644
+--- a/services/plugins/dndcp/waylandClipboard/waylandClipboard.h
++++ b/services/plugins/dndcp/waylandClipboard/waylandClipboard.h
+@@ -52,8 +52,9 @@ typedef struct {
+ /*
+  * Connect and bind ext-data-control-v1.
+  *
+- * Returns FALSE when the compositor does not implement the protocol. GNOME is
+- * the main case, since it does not implement data control protocols.
++ * Returns FALSE when the compositor does not implement the protocol, and the
++ * caller then falls back to wl-clipboard. GNOME is the main case, since it
++ * does not implement data control protocols.
+  */
+ gboolean WaylandClipboard_Init(void);
+ void WaylandClipboard_Exit(void);
+-- 
+2.55.0
+

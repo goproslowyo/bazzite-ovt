@@ -1,17 +1,18 @@
-# Bazzite + open-vm-tools with a Wayland clipboard backend.
+# Bazzite with open-vm-tools rebuilt for Wayland copy and paste and drag and
+# drop.
 #
-# Stage 1 rebuilds Fedora's open-vm-tools with every patch in patches/;
+# Stage 1 rebuilds Fedora's open-vm-tools with every patch in patches/, and
 # stage 2 replaces the base image's copies with the rebuilt ones.
 #
 #   podman build -t bazzite-ovt .
 #
-# To add a patch: drop it in patches/. Nothing here needs editing -- the spec
-# is rewritten from whatever the directory contains, in sorted order, so name
+# To add a patch, drop it in patches/. Nothing here needs editing. The spec is
+# rewritten from whatever the directory contains, in sorted order, so name
 # files 0001-, 0002-, ... to control apply order.
 #
-# Both stages fail loudly rather than silently shipping something unpatched:
-# the version guard catches a Fedora rebase, the strings check catches a build
-# where autoreconf did not pick up the new sources.
+# Both stages fail rather than ship something unpatched. The version guard
+# catches a Fedora rebase, and the strings check catches a build where
+# autoreconf did not pick up the new sources.
 
 ARG BASE_IMAGE=ghcr.io/ublue-os/bazzite:stable
 ARG FEDORA_RELEASE=44
@@ -22,7 +23,7 @@ ARG OVT_VERSION=13.1.0
 # ---------------------------------------------------------------------------
 FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE} AS builder
 ARG OVT_VERSION
-# Re-declared: an ARG before the first FROM is global scope only, and the
+# Declared again. An ARG before the first FROM is global scope only, and the
 # src.rpm signature check below needs the release to name Fedora's key.
 ARG FEDORA_RELEASE
 
@@ -32,13 +33,13 @@ RUN dnf install -y fedora-packager rpmdevtools 'dnf-command(builddep)' \
 RUN rpmdev-setuptree
 WORKDIR /root/rpmbuild
 
-# Kept in their own directory: SOURCES/ also receives Fedora's own patches
+# Kept in their own directory. SOURCES/ also receives Fedora's own patches
 # from the src.rpm, and globbing there would re-register those.
 COPY patches/ /patches/
 
 # Fetch the distro source package.
 #
-# Name the two source repos rather than globbing '*-source': the glob also
+# Name the two source repos rather than globbing '*-source'. The glob also
 # matches updates-testing-source, so the build could silently pick up an SRPM
 # that has not passed Bodhi gating.
 #
@@ -46,7 +47,7 @@ COPY patches/ /patches/
 # default _pkgverify_level is 'digest', so an unsigned or tampered src.rpm
 # would install without complaint. This is the one input that becomes the
 # shipped binary, so verify it against Fedora's key explicitly. Compare the
-# whole line: an unsigned package prints "<name>: digests OK" and exits 0, so
+# whole line. An unsigned package prints "<name>: digests OK" and exits 0, so
 # a substring match on the verdict can be satisfied by the file's name.
 RUN set -eux; \
     dnf download --source open-vm-tools \
@@ -85,6 +86,10 @@ RUN set -eux; \
 # simply be appended to, so the whole Release value is replaced. The high
 # number keeps this sorting above whatever Fedora ships, which is what
 # "rpm-ostree override replace" requires.
+#
+# The patches generate their Wayland protocol code at build time. The spec
+# gains the packages that needs, and --with-wayland makes configure fail
+# rather than build a plugin without the Wayland backend if one is missing.
 RUN set -eux; \
     export LC_ALL=C; \
     spec=SPECS/open-vm-tools.spec; \
@@ -115,6 +120,10 @@ RUN set -eux; \
     sed -i "${anchor}r /tmp/patchlines" "$spec"; \
     sed -i -E 's|^Release:[[:space:]]*.*$|Release:          100%{?dist}.clipway|' "$spec"; \
     grep -qE '^Release:.*clipway' "$spec"; \
+    sed -i '/^BuildRequires:[[:space:]]*pkgconfig(gtkmm-4.0)/a BuildRequires:    pkgconfig(wayland-client)\nBuildRequires:    pkgconfig(wayland-scanner)\nBuildRequires:    pkgconfig(wayland-protocols) >= 1.39' "$spec"; \
+    grep -q '^BuildRequires:.*pkgconfig(wayland-protocols)' "$spec"; \
+    sed -i 's|^\([[:space:]]*\)--with-gtk4 \\$|&\n\1--with-wayland \\|' "$spec"; \
+    grep -q -- '--with-wayland' "$spec"; \
     echo "--- registered:"; \
     grep -nE '^(Release|Patch[0-9]+):' "$spec"
 
@@ -130,21 +139,34 @@ RUN set -eux; \
     cp RPMS/x86_64/open-vm-tools-desktop-${OVT_VERSION}-*.clipway.*.rpm /rpms/; \
     ls -1 /rpms
 
-# Canary: one literal per patch, so a patch that silently stops applying fails
-# the build instead of shipping a stock binary. In order: the native Wayland
-# selection, the wl-clipboard fallback, and the detection window's adoption
-# wait, which is what makes guest to host drags reach us at all.
+# Only the patched sources contain these log strings, so a build that lost a
+# patch fails here instead of shipping a stock binary. There is one per patch,
+# in patch order, except 0005, which adds only configure and build rules. The
+# Wayland strings after it cannot be built without that patch.
 RUN set -eux; \
     cd "$(mktemp -d)"; \
     rpm2cpio /rpms/open-vm-tools-desktop-*.rpm | cpio -idm --quiet; \
     so=./usr/lib64/open-vm-tools/plugins/vmusr/libdndcp.so; \
-    strings "$so" | grep -q 'ext-data-control-v1'; \
-    strings "$so" | grep -q 'wl-copy'; \
-    strings "$so" | grep -q 'managed after'; \
-    strings "$so" | grep -q 'pressing on the detection window'; \
-    strings "$so" | grep -q 'releasing the faked button'; \
     strings "$so" | grep -q 'unsafe fileItem'; \
     strings "$so" | grep -q 'no XDG_CURRENT_DESKTOP'; \
+    strings "$so" | grep -q 'no X display, uinput disabled'; \
+    strings "$so" | grep -q 'drag entering, telling the host'; \
+    strings "$so" | grep -q 'using ext-data-control-v1'; \
+    strings "$so" | grep -q 'host clip offers'; \
+    strings "$so" | grep -q 'clipboard text too large'; \
+    strings "$so" | grep -q 'wl-copy is not installed'; \
+    strings "$so" | grep -q 'reading the selection only after it changes'; \
+    strings "$so" | grep -q 'skipping non-file uri'; \
+    strings "$so" | grep -q 'paste observed, requesting files'; \
+    strings "$so" | grep -q 'managed after'; \
+    strings "$so" | grep -q 'native drag source ready'; \
+    strings "$so" | grep -q 'drag started from serial'; \
+    strings "$so" | grep -q 'formats natively'; \
+    strings "$so" | grep -q 'placeholders under'; \
+    strings "$so" | grep -q 'never agreed'; \
+    strings "$so" | grep -q 'Mutter bridges XDND'; \
+    strings "$so" | grep -q 'outlived the drop'; \
+    strings "$so" | grep -q 'PruneStagingDirectories'; \
     echo "patched dndcp verified"
 
 # ---------------------------------------------------------------------------
@@ -165,7 +187,7 @@ RUN set -eux; \
 #
 # The stock policy only verifies ghcr.io/ublue-os and some Red Hat sources, so
 # without this an ostree-image-signed reference to our repo is refused. Note
-# the bootstrap order: the policy lives inside the image, so a machine has to
+# the bootstrap order. The policy lives inside the image, so a machine has to
 # run the unsigned image once before it can switch to the signed reference.
 COPY cosign.pub /etc/pki/containers/bazzite-ovt.pub
 

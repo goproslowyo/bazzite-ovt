@@ -1,0 +1,1114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:11 -0700
+Subject: [PATCH 19/21] dndcp: Make host to guest drags reach Wayland
+ applications on GNOME
+
+GNOME has no layer shell, so the native drag source is not available
+there, and a host to guest drag stays on XDND from the Xwayland
+detection window. Mutter bridges such a drag to Wayland clients, but
+only under conditions the plugin did not meet. Every drop onto a Wayland
+application such as Nautilus was lost, with stock open-vm-tools as well.
+
+Mutter starts the bridge when an X client takes XdndSelection, and only
+if a pointer then has a button held over an Xwayland window. It then
+follows its own pointer and maps an XDND proxy window over whichever
+Wayland window is under it. At the start of each drag the plugin now
+checks for a Wayland session without the native source whose X window
+manager is Mutter. It finds the window manager the EWMH way, through
+_NET_SUPPORTING_WM_CHECK and the _NET_WM_NAME that Mutter sets to "GNOME
+Shell" or "Mutter", and reads it again for every drag, since the window
+manager can be replaced. Every other session keeps the upstream XDND
+behaviour. Under Mutter the plugin does the following.
+
+It asks for _NET_WM_STATE_ABOVE on the detection window, which stays
+managed. GNOME keeps a window that was mapped without focus below the
+focused one, so the press landed on whatever the user had last clicked.
+
+It presses in the middle of the window where the compositor put it, and
+does not move the window to the press first. It presses only once the X
+server reports the pointer at that spot and over the window. A press
+anywhere else lands on the window underneath and starts moving it. If
+the pointer does not get there, the plugin does not press, and tries
+again on the host's next motion, up to three times.
+
+It moves across the window in small steps from the main loop, because
+GTK does not start a drag from motion that arrives all at once. The
+pointer stays on the window until 300 ms after GTK has started the drag,
+so that Mutter finds it there when it looks. Leaving at once works only
+while the pointer's implicit grab holds it on the window, which it no
+longer does after any click on a Wayland window.
+
+It does not warp the X pointer. Xwayland carries out a warp from the
+client under the pointer with a pointer lock, and Mutter's pointer then
+stays on the detection window while only Xwayland's moves.
+
+It releases the button once the target has accepted the drag, or after
+1.5 s, instead of as soon as the host drops. An accept counts only from
+100 ms after the pointer has left the detection window. The window is a
+drop target too, for guest to host drags, so it answers the drag while
+it starts over it, and GTK keeps that answer until the next target
+replies. A drop with no GTK drag to wait for, because GTK never started
+it or it has already ended, releases at once.
+
+It ignores a GTK drag from an earlier host drag, at its begin and at its
+end. When the host cancels before GTK has run the main loop, the old
+press can start a GTK drag after the next host drag has begun. A drop
+that the target never accepted can stay alive in GTK until the next drag
+begins, and resetting on its end released the new drag's press.
+
+It keeps the detection window mapped while a drag is still starting from
+it or waiting to release. When the host's files arrive the common layer
+returns to READY and hides the window, and on a quick drop that happened
+before the release, which took the drag's origin away.
+
+For host to guest drags, a test program drove the plugin's own detection
+window and uinput code through this sequence on GNOME 50.3 (Bluefin 44),
+and 199 of 200 runs landed the drop. Host drags into Nautilus were then
+tested by hand with the final code.
+---
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |  30 +
+ .../dndcp/dndGuestBase/dragDetWndX11GTK4.h    |  15 +
+ services/plugins/dndcp/dndUIX11GTK4.cpp       | 566 +++++++++++++++++-
+ services/plugins/dndcp/dragDetWndX11GTK4.cpp  | 200 ++++++-
+ 4 files changed, 804 insertions(+), 7 deletions(-)
+
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index 3bd08b2..c60570f 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -81,6 +81,15 @@ private:
+    void AddBlock();
+    void RemoveBlock();
+    bool LocalWaylandDragPreferred(void);
++   void LocalXdndChoosePath(void);
++   bool LocalMutterBridgesXdnd(void);
++   void LocalXdndLeaveDetWnd(void);
++   static gboolean OnXdndBeginTimeout(gpointer ctx);
++   void LocalXdndRelease(void);
++   void LocalXdndForget(void);
++   void LocalXdndRestoreDetWnd(void);
++   bool LocalXdndIsStaleDrag(GdkDrag *drag);
++   static gboolean OnXdndReleaseTick(gpointer ctx);
+    bool StageFilePlaceholders(const DnDFileList &fList);
+    void ClearFilePlaceholders(void);
+    void AddBlockForDrop(void);
+@@ -247,6 +256,27 @@ private:
+    bool mHGDragStarted;
+    /* A faked press is outstanding; it must not outlive the drag. */
+    bool mHGButtonDown;
++   /*
++    * The XDND drag was pressed on the detection window and the pointer stays
++    * there until GTK has started the drag. See LocalXdndLeaveDetWnd().
++    */
++   bool mHGXdndWaitBegin;
++   guint mHGXdndBeginTimer;
++   gint64 mHGXdndBeginDeadline;
++   int mHGXdndPressX;
++   int mHGXdndPressY;
++   int mHGXdndStep;
++   /* Host motions on which the press could not be placed; see OnMoveMouse(). */
++   int mHGXdndPressRounds;
++   /* The GTK drag, for the target's answer at the drop. */
++   GdkDrag *mHGXdndDrag;
++   guint mHGXdndReleaseTimer;
++   gint64 mHGXdndLeaveAt;
++   gint64 mHGXdndLeftAt;
++   gint64 mHGXdndDropAt;
++   int mHGXdndReleaseTicks;
++   /* See LocalXdndChoosePath(). */
++   bool mMutterBridgesXdnd;
+    /* A native Wayland drag is running, so the XDND teardown must not run. */
+    bool mWaylandDragActive;
+    /* Which native drag is current; a done() for any other is ignored. */
+diff --git a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+index 9453f34..4534bab 100644
+--- a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+@@ -78,6 +78,19 @@ public:
+    /* Where the compositor put the window, which may not be where asked. */
+    void GetGeometry(int &x, int &y, int &width, int &height);
+    void RefreshScreenSize(void);
++   /*
++    * Whether SimulateXEvents() also warps the X pointer after a uinput move.
++    * The warp is on by default. SimulateXEvents() explains when it is not.
++    */
++   void SetWarpXPointer(bool warp) { mWarpXPointer = warp; }
++   void SetAbove(bool above);
++   /* Whether the X window manager is Mutter; wmName gets its _NET_WM_NAME. */
++   bool WmIsMutter(std::string &wmName);
++   /*
++    * Whether the X server has the pointer at (x, y), within a pixel, and
++    * over the detection window.
++    */
++   bool PointerIsOver(int x, int y);
+    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
+                   int mouseX,
+                   int mouseY);
+@@ -115,6 +128,8 @@ private:
+    bool mUseUInput;
+    /* The X server is Xwayland, under a Wayland compositor. */
+    bool mUnderWayland;
++   bool mWarpXPointer;
++   bool mAbove;
+    /* Where SetGeometry() last asked for the window, for the WM_NORMAL_HINTS. */
+    bool mPlaced;
+    int mPlacedX;
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index 85b155c..f08ea94 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -78,6 +78,57 @@ extern "C" {
+  */
+ #define WAYLAND_DRAG_ACCEPT_TIMEOUT_MS 500
+ 
++/*
++ * How an XDND drag that Mutter bridges is started. After the press the
++ * pointer moves across the detection window in small steps, one per tick,
++ * with the main loop running in between. GTK does not start a drag from
++ * motion that all arrives at once. The pointer then stays on the window
++ * until GTK has started the drag, or until the timeout.
++ */
++#define XDND_DRAG_BEGIN_TICK_MS 20
++#define XDND_DRAG_BEGIN_STEPS 6
++#define XDND_DRAG_BEGIN_TIMEOUT_MS 500
++
++/*
++ * How many times, and how far apart, the pointer is placed on the detection
++ * window before the press, until X reports it there. When every try fails,
++ * the press is tried again on the host's next motion, for up to
++ * XDND_PRESS_ROUNDS motions, and after that the drag is given up.
++ */
++#define XDND_PRESS_TRIES 10
++#define XDND_PRESS_RETRY_MS 20
++#define XDND_PRESS_ROUNDS 3
++
++/*
++ * How long the pointer stays on the detection window after GTK has started
++ * the drag. GTK takes XdndSelection as it starts the drag, and Mutter checks
++ * where the pointer is when it sees that. Leaving at once loses the race
++ * whenever the pointer's implicit grab is not holding it on the window. On
++ * GNOME 50, after a click in another window, 150 ms still lost about one
++ * drag in 40, and 300 ms lost none in 80.
++ */
++#define XDND_LEAVE_DELAY_MS 300
++
++/* How long a drop that came before the pointer left waits for it to leave. */
++#define XDND_DROP_WAIT_LEAVE_MS 1500
++
++/*
++ * How long a bridged XDND drop waits for the target to accept before the
++ * button comes up anyway, and how many ticks of XDND_DRAG_BEGIN_TICK_MS pass
++ * between nudges.
++ */
++#define XDND_DROP_ACCEPT_TIMEOUT_MS 1500
++#define XDND_DROP_NUDGE_TICKS 4
++
++/*
++ * How long after the pointer leaves the detection window an accept can be
++ * trusted. The detection window is a drop target too, for guest to host
++ * drags, so it answers the drag while the drag starts over it, and GTK
++ * keeps that answer until the next target sends its own. Mutter answers
++ * for the window under the pointer within a few milliseconds of a motion.
++ */
++#define XDND_DROP_SETTLE_MS 100
++
+ 
+ /*
+  *-----------------------------------------------------------------------------
+@@ -103,6 +154,20 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
+       mGHReads(NULL),
+       mInHGDrag(false),
+       mHGButtonDown(false),
++      mHGXdndWaitBegin(false),
++      mHGXdndBeginTimer(0),
++      mHGXdndBeginDeadline(0),
++      mHGXdndPressX(0),
++      mHGXdndPressY(0),
++      mHGXdndStep(0),
++      mHGXdndPressRounds(0),
++      mHGXdndDrag(NULL),
++      mHGXdndReleaseTimer(0),
++      mHGXdndLeaveAt(0),
++      mHGXdndLeftAt(0),
++      mHGXdndDropAt(0),
++      mHGXdndReleaseTicks(0),
++      mMutterBridgesXdnd(false),
+       mWaylandDragActive(false),
+       mWaylandDragGen(0),
+       mHGDeferBlock(false),
+@@ -334,6 +399,8 @@ DnDUIX11::ResetUI()
+       }
+       mHGButtonDown = false;
+    }
++   LocalXdndForget();
++   LocalXdndRestoreDetWnd();
+    mGHDnDDataReceived = false;
+    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+    mGHDnDInProgress = false;
+@@ -375,6 +442,245 @@ DnDUIX11::LocalWaylandDragPreferred(void)
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalXdndChoosePath --
++ *
++ *      Decide, at the start of a drag, whether Mutter bridges the XDND drag
++ *      between the detection window and Wayland clients, and log the
++ *      decision. That is the case in a Wayland session with no native drag
++ *      source when the X window manager is Mutter. Every other session keeps
++ *      the upstream XDND behaviour.
++ *
++ *      Mutter starts the bridge when the X client takes XdndSelection, and
++ *      only if the pointer is then over an Xwayland window with a button
++ *      held. So the drag has to start while the pointer is still on the
++ *      detection window, and the pointer must stay unlocked for the rest of
++ *      the drag. See LocalXdndLeaveDetWnd() and DragDetWnd::SimulateXEvents().
++ *      Other compositors without a layer shell may bridge XDND too, but
++ *      these steps and their timings were measured on Mutter only.
++ *
++ *      The window manager is read again on every drag because it can be
++ *      replaced while the plugin runs, and the read costs a few X round
++ *      trips.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      Sets mMutterBridgesXdnd, which LocalMutterBridgesXdnd() returns.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalXdndChoosePath(void)
++{
++   const char *type = getenv("XDG_SESSION_TYPE");
++   std::string wmName;
++
++   mMutterBridgesXdnd = false;
++   if (type == NULL || strcmp(type, "wayland") != 0) {
++      g_debug("%s: Mutter does not bridge XDND (not a Wayland session)\n",
++              __FUNCTION__);
++   } else if (WaylandDrag_IsAvailable()) {
++      g_debug("%s: Mutter does not bridge XDND (native drag source)\n",
++              __FUNCTION__);
++   } else if (mDetWnd == NULL || !mDetWnd->WmIsMutter(wmName)) {
++      g_debug("%s: Mutter does not bridge XDND (window manager \"%s\")\n",
++              __FUNCTION__, wmName.c_str());
++   } else {
++      mMutterBridgesXdnd = true;
++      g_debug("%s: Mutter bridges XDND (window manager \"%s\")\n",
++              __FUNCTION__, wmName.c_str());
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalMutterBridgesXdnd --
++ *
++ *      Whether the current drag takes the steps Mutter needs to bridge it to
++ *      Wayland clients. See LocalXdndChoosePath().
++ *
++ * Results:
++ *      True if the drag needs that treatment.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DnDUIX11::LocalMutterBridgesXdnd(void)
++{
++   return mMutterBridgesXdnd;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalXdndLeaveDetWnd --
++ *
++ *      Move the pointer from the detection window to where the host has it,
++ *      once GTK has started the drag or has had the time to.
++ *
++ *      GTK handles the press and the motion that start the drag only when
++ *      the main loop runs, which is after OnMoveMouse() returns. Moving the
++ *      pointer away inside OnMoveMouse(), as the other paths do, means the
++ *      drag starts with the pointer over a Wayland window. Mutter then does
++ *      not bridge it, whenever the pointer's implicit grab no longer holds
++ *      it on the detection window, which is the case after any click on a
++ *      Wayland window in the session.
++ *
++ * Side effects:
++ *      Moves the pointer.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalXdndLeaveDetWnd(void)
++{
++   if (!mHGXdndWaitBegin) {
++      return;
++   }
++   mHGXdndWaitBegin = false;
++   mHGXdndLeftAt = g_get_monotonic_time();
++   if (mHGXdndBeginTimer != 0) {
++      g_source_remove(mHGXdndBeginTimer);
++      mHGXdndBeginTimer = 0;
++   }
++   g_debug("%s: moving to the host's pointer at (%d, %d)\n", __FUNCTION__,
++           mMousePosX, mMousePosY);
++   mDetWnd->SimulateXEvents(false, false, false, false, true,
++                            mMousePosX, mMousePosY);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalXdndForget --
++ *
++ *      Stop the timers of a bridged XDND drag, clear its wait state, and
++ *      release the reference to its GTK drag.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalXdndForget(void)
++{
++   mHGXdndWaitBegin = false;
++   mHGXdndLeftAt = 0;
++   if (mHGXdndBeginTimer != 0) {
++      g_source_remove(mHGXdndBeginTimer);
++      mHGXdndBeginTimer = 0;
++   }
++   if (mHGXdndReleaseTimer != 0) {
++      g_source_remove(mHGXdndReleaseTimer);
++      mHGXdndReleaseTimer = 0;
++   }
++   if (mHGXdndDrag != NULL) {
++      g_object_unref(mHGXdndDrag);
++      mHGXdndDrag = NULL;
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalXdndIsStaleDrag --
++ *
++ *      Whether `drag` is a GTK drag from an earlier host drag. A GTK drag can
++ *      end or be cancelled well after the host has moved on, for example
++ *      when a drop the target never accepted is only cancelled once the next
++ *      drag begins. Its end says nothing about the host drag in progress,
++ *      and resetting on it would release that drag's press.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DnDUIX11::LocalXdndIsStaleDrag(GdkDrag *drag)   // IN
++{
++   if (!mInHGDrag || drag == mHGXdndDrag) {
++      return false;
++   }
++   g_debug("%s: ignoring the end of a drag from an earlier host drag\n",
++           __FUNCTION__);
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalXdndRestoreDetWnd --
++ *
++ *      Turn the X pointer warp back on, which a guest to host drag needs, and
++ *      restore normal stacking. A bridged XDND drag changes both. A drag can
++ *      end without ResetUI(), on a host cancel or at the drop, so those paths
++ *      call this too.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalXdndRestoreDetWnd(void)
++{
++   if (mDetWnd != NULL) {
++      mDetWnd->SetWarpXPointer(true);
++      mDetWnd->SetAbove(false);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::OnXdndBeginTimeout --
++ *
++ *      Wake the main loop while the pointer waits on the detection window,
++ *      and stop holding it if GTK has not started the drag in time. See
++ *      XDND_DRAG_BEGIN_TICK_MS.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++DnDUIX11::OnXdndBeginTimeout(gpointer ctx)   // IN: the DnDUIX11
++{
++   DnDUIX11 *ui = static_cast<DnDUIX11 *>(ctx);
++
++   if (ui->mHGXdndStep < XDND_DRAG_BEGIN_STEPS) {
++      ui->mHGXdndStep++;
++      ui->mDetWnd->SimulateXEvents(false, false, false, false, true,
++                                   ui->mHGXdndPressX + 3 * ui->mHGXdndStep,
++                                   ui->mHGXdndPressY);
++      return G_SOURCE_CONTINUE;
++   }
++   gint64 now = g_get_monotonic_time();
++
++   if (ui->mHGXdndLeaveAt != 0 ? now < ui->mHGXdndLeaveAt
++                               : now < ui->mHGXdndBeginDeadline) {
++      return G_SOURCE_CONTINUE;
++   }
++   ui->mHGXdndBeginTimer = 0;
++   if (ui->mHGXdndLeaveAt == 0) {
++      g_debug("%s: GTK did not start the drag in %ums\n", __FUNCTION__,
++              (unsigned) XDND_DRAG_BEGIN_TIMEOUT_MS);
++   }
++   ui->LocalXdndLeaveDetWnd();
++
++   return G_SOURCE_REMOVE;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -1003,6 +1309,18 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+     */
+    LocalCancelWaylandDrag();
+ 
++   /*
++    * A bridged XDND drop still waiting for its target is let go now, since
++    * the host has moved on.
++    */
++   if (mHGXdndReleaseTimer != 0) {
++      g_source_remove(mHGXdndReleaseTimer);
++      mHGXdndReleaseTimer = 0;
++      LocalXdndRelease();
++   }
++   LocalXdndForget();
++   mHGXdndPressRounds = 0;
++
+    /*
+     * The compositor may have been slow to answer at login, or its
+     * connection may have dropped since. WaylandDrag_Init() returns at once
+@@ -1011,12 +1329,29 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+    if (!WaylandDrag_IsAvailable()) {
+       WaylandDrag_Init();
+    }
++   LocalXdndChoosePath();
+ 
+    /* The host's coordinates are for the screen as it is now. */
+    mDetWnd->RefreshScreenSize();
+ 
++   /*
++    * An X pointer warp stops Mutter bridging the drag to Wayland clients;
++    * see DragDetWnd::SimulateXEvents(). A bridged drag therefore moves the
++    * pointer through uinput only. LocalXdndRestoreDetWnd() turns the warp
++    * back on when the drag ends.
++    */
++   mDetWnd->SetWarpXPointer(!LocalMutterBridgesXdnd());
++
+    /* Move detect window to the mouse in position */
+    ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
++   /*
++    * Mutter keeps a window mapped without focus below the focused one, so the
++    * press would land on whatever the user last clicked.
++    * LocalXdndRestoreDetWnd() undoes this.
++    */
++   if (LocalMutterBridgesXdnd()) {
++      mDetWnd->SetAbove(true);
++   }
+ 
+    TRACE_CALL();
+ 
+@@ -1327,10 +1662,14 @@ void
+ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+                       int32 y)  // IN: Pointer y-coord
+ {
+-   // Position the pointer, and record its position.
+-   mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
+    mMousePosX = x;
+    mMousePosY = y;
++   if (mHGXdndWaitBegin) {
++      /* LocalXdndLeaveDetWnd() moves the pointer here once GTK is ready. */
++      return;
++   }
++   // Position the pointer.
++   mDetWnd->SimulateXEvents(false, false, false, false, true, x, y);
+ #ifdef USE_UINPUT
+    if (mWaylandDragActive) {
+       /* Serve the target between host motions. See WaylandDrag_Pump(). */
+@@ -1378,6 +1717,17 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+              */
+             int detX = 0, detY = 0, detW = 0, detH = 0;
+             int pressX = x, pressY = y;
++            bool bridged = LocalMutterBridgesXdnd();
++
++            if (bridged) {
++               /*
++                * Where the window was asked to be, in case its geometry is
++                * not known yet. The window is not moved for the press here,
++                * so the geometry below is where the compositor put it.
++                */
++               pressX = mOriginX + DRAG_DET_WINDOW_WIDTH;
++               pressY = mOriginY + DRAG_DET_WINDOW_WIDTH;
++            }
+ 
+             /*
+              * GTK starts the drag from a press followed by motion on the
+@@ -1395,11 +1745,78 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+                           pressX, pressY, x, y);
+                }
+             }
+-            mDetWnd->SimulateXEvents(true, true, false, true, true, pressX, pressY);
++            if (bridged) {
++               /*
++                * Press only where X has the pointer over the window. The
++                * window manager can still be placing the window when it is
++                * first shown, so alternate between where the window reports
++                * it is and the middle of where it was asked to be. A press
++                * anywhere else lands on the window underneath and starts
++                * moving it.
++                */
++               bool over = false;
++
++               for (int i = 0; i < XDND_PRESS_TRIES && !over; i++) {
++                  int tx = mOriginX + DRAG_DET_WINDOW_WIDTH;
++                  int ty = mOriginY + DRAG_DET_WINDOW_WIDTH;
++
++                  mDetWnd->GetGeometry(detX, detY, detW, detH);
++                  if (i % 2 == 0 && detW > 0 && detH > 0) {
++                     tx = detX + detW / 2;
++                     ty = detY + detH / 2;
++                  }
++                  mDetWnd->SimulateXEvents(false, false, false, false, true,
++                                           tx, ty);
++                  /* SimulateXEvents() ends a pixel down and right. */
++                  over = mDetWnd->PointerIsOver(tx + 1, ty + 1);
++                  if (over) {
++                     pressX = tx;
++                     pressY = ty;
++                  } else {
++                     g_usleep(XDND_PRESS_RETRY_MS * 1000);
++                  }
++               }
++               if (!over) {
++                  /*
++                   * Try again on the host's next motion, a few times, and
++                   * otherwise let the drag fail without pressing at all.
++                   * Nothing has been pressed yet.
++                   */
++                  mHGButtonDown = false;
++                  mHGXdndPressRounds++;
++                  g_debug("%s: the pointer never reached the detection "
++                          "window (round %d)\n", __FUNCTION__,
++                          mHGXdndPressRounds);
++                  if (mHGXdndPressRounds >= XDND_PRESS_ROUNDS) {
++                     mHGDragStarted = true;
++                  }
++                  return;
++               }
++            }
++            mDetWnd->SimulateXEvents(true, true, false, !bridged, true,
++                                     pressX, pressY);
+             // simulate drag mouse press
+             mDetWnd->SimulateXEvents(false, true, true, false, true, pressX, pressY);
+             // Tell Gtk that a drag should be started from this widget.
+             mDetWnd->StartDrag(mProvider, pressX, pressY);
++            if (bridged) {
++               /*
++                * The motion that makes GTK start the drag comes from
++                * OnXdndBeginTimeout(), one small step per tick, and the
++                * pointer stays on the window until GTK has started it.
++                */
++               mHGXdndPressX = pressX;
++               mHGXdndPressY = pressY;
++               mHGXdndStep = 0;
++               mHGXdndLeaveAt = 0;
++               mHGXdndWaitBegin = true;
++               mHGXdndBeginDeadline = g_get_monotonic_time() +
++                                      (gint64) XDND_DRAG_BEGIN_TIMEOUT_MS * 1000;
++               mHGXdndBeginTimer = g_timeout_add(XDND_DRAG_BEGIN_TICK_MS,
++                                                 OnXdndBeginTimeout, this);
++               mHGDragStarted = true;
++               return;
++            }
+ 
+             /*
+              * Put the pointer back where the host has it. The press had to
+@@ -1442,6 +1859,7 @@ DnDUIX11::OnSrcCancel()
+     * is under the pointer.
+     */
+    LocalCancelWaylandDrag();
++   LocalXdndForget();
+    /*
+     * Force the window to show, position the mouse over it, and release.
+     * Seems like moving the window to 0, 0 eliminates frequently observed
+@@ -1455,6 +1873,7 @@ DnDUIX11::OnSrcCancel()
+    ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
+    mDetWnd->SimulateXEvents(false, false, false, false, true,
+                            mMousePosX, mMousePosY);
++   LocalXdndRestoreDetWnd();
+    /* The real release has been sent; ResetUI() need not send another. */
+    mHGButtonDown = false;
+    mInHGDrag = false;
+@@ -1638,6 +2057,50 @@ DnDUIX11::OnSrcDrop()
+       return;
+    }
+ #endif
++   /*
++    * A drag that GTK never started, or has already ended, has no target to
++    * wait for. Waiting would only pull the pointer back to the drop point
++    * on every nudge.
++    */
++   if (   LocalMutterBridgesXdnd()
++       && mInHGDrag
++       && mHGButtonDown
++       && (mHGXdndDrag != NULL || mHGXdndWaitBegin)) {
++      /*
++       * The drop is decided on the target's last XdndStatus, which GTK only
++       * sees when the main loop runs, and the host lets go as soon as the
++       * user does, often before the target has answered. Release from the
++       * main loop once the target has accepted. See OnXdndReleaseTick().
++       */
++      mHGXdndDropAt = g_get_monotonic_time();
++      mHGXdndReleaseTicks = 0;
++      if (mHGXdndReleaseTimer == 0) {
++         mHGXdndReleaseTimer = g_timeout_add(XDND_DRAG_BEGIN_TICK_MS,
++                                             OnXdndReleaseTick, this);
++      }
++      return;
++   }
++   LocalXdndRelease();
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalXdndRelease --
++ *
++ *      Release the button that has held the XDND drag.
++ *
++ * Side effects:
++ *      Adds the deferred vmblock block, if any, shows and hides the detection
++ *      window, and fakes the release.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::LocalXdndRelease(void)
++{
+    AddBlockForDrop();
+    ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
+ 
+@@ -1651,6 +2114,57 @@ DnDUIX11::OnSrcDrop()
+    ShowDetWnd(false, 0, 0, DET_WND_DRAG_SOURCE);
+    /* We've successful or failure for HG drag, set the flag to false anyway */
+    mInHGDrag = false;
++   /* After the release. A warp with the button still down stops the bridge. */
++   LocalXdndRestoreDetWnd();
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::OnXdndReleaseTick --
++ *
++ *      Release a bridged XDND drop once the target has accepted it, or when
++ *      the time is up. While it has not, move the pointer a pixel and back
++ *      now and then, since a target only answers motion.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++DnDUIX11::OnXdndReleaseTick(gpointer ctx)   // IN: the DnDUIX11
++{
++   DnDUIX11 *ui = static_cast<DnDUIX11 *>(ctx);
++   gint64 now = g_get_monotonic_time();
++   bool accepted;
++
++   /* The pointer has to leave the detection window before anything else. */
++   if (ui->mHGXdndWaitBegin) {
++      if (now - ui->mHGXdndDropAt < (gint64) XDND_DROP_WAIT_LEAVE_MS * 1000) {
++         return G_SOURCE_CONTINUE;
++      }
++      ui->LocalXdndLeaveDetWnd();
++   }
++   accepted = ui->mHGXdndDrag != NULL &&
++              gdk_drag_get_selected_action(ui->mHGXdndDrag) != 0 &&
++              now - ui->mHGXdndLeftAt >= (gint64) XDND_DROP_SETTLE_MS * 1000;
++   ui->mHGXdndReleaseTicks++;
++   if (!accepted &&
++       now - MAX(ui->mHGXdndLeftAt, ui->mHGXdndDropAt) <
++          (gint64) XDND_DROP_ACCEPT_TIMEOUT_MS * 1000) {
++      if (ui->mHGXdndReleaseTicks % XDND_DROP_NUDGE_TICKS == 0) {
++         /* SimulateXEvents() moves to the point and a pixel beyond it. */
++         ui->mDetWnd->SimulateXEvents(false, false, false, false, true,
++                                      ui->mMousePosX, ui->mMousePosY);
++      }
++      return G_SOURCE_CONTINUE;
++   }
++   g_debug("%s: releasing, target %s\n", __FUNCTION__,
++           accepted ? "accepted" : "never accepted");
++   ui->mHGXdndReleaseTimer = 0;
++   ui->LocalXdndRelease();
++
++   return G_SOURCE_REMOVE;
+ }
+ 
+ 
+@@ -1761,8 +2275,10 @@ DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
+  * DnDUIX11::OnUpdateDetWnd --
+  *
+  *      Callback to show/hide drag detection window. This is only wired to the
+- *      common layer's updateDetWndChanged signal, which the host drives on the
+- *      guest to host path, so the window is always a drop target here.
++ *      common layer's updateDetWndChanged signal. The host drives it on the
++ *      guest to host path, where the window is a drop target, and the common
++ *      layer also hides the window when it returns to READY after a host to
++ *      guest transfer.
+  *
+  * Results:
+  *      Shows/hides and moves detection window.
+@@ -1778,6 +2294,17 @@ DnDUIX11::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
+                          int32 x,       // IN: detection window's destination x-coord
+                          int32 y)       // IN: detection window's destination y-coord
+ {
++   /*
++    * A bridged host to guest drag can still be starting from the window, or
++    * waiting to release on it, when the host's files arrive and the common
++    * layer returns to READY. Hiding the window then takes the drag's origin
++    * away and Mutter drops the drag. LocalXdndRelease() hides it afterwards.
++    */
++   if (!show && (mHGXdndWaitBegin || mHGXdndReleaseTimer != 0)) {
++      g_debug("%s: keeping the window for the drag in progress\n",
++              __FUNCTION__);
++      return;
++   }
+    ShowDetWnd(show, x, y, DET_WND_DROP_TARGET);
+ }
+ 
+@@ -1834,6 +2361,29 @@ DnDUIX11::OnGtkSrcDragBegin(const Glib::RefPtr< Gdk::Drag > &drag, void *ctx)
+    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
+    g_debug("%s: DND drag begin with ctx %ld\n", __FUNCTION__,
+            this_instance->mDetWnd->Get_Current_Drag_ctx());
++   /*
++    * GTK starts a drag from the press and motion only when the main loop
++    * runs. When the host cancels before then, the GTK drag of the old press
++    * can begin after OnSrcDragBegin() of the next host drag. That drag has
++    * no drag of its own until OnMoveMouse() presses, so a begin before the
++    * press belongs to the old one. Keeping it would make its end look
++    * current to LocalXdndIsStaleDrag().
++    */
++   if (   !this_instance->mInHGDrag
++       || !this_instance->mHGDragStarted
++       || !this_instance->mHGButtonDown) {
++      g_debug("%s: not a drag of the current host drag\n", __FUNCTION__);
++      return;
++   }
++   if (this_instance->mHGXdndDrag != NULL) {
++      g_object_unref(this_instance->mHGXdndDrag);
++   }
++   this_instance->mHGXdndDrag = GDK_DRAG(g_object_ref(drag->gobj()));
++   if (this_instance->mHGXdndWaitBegin) {
++      /* OnXdndBeginTimeout() moves the pointer off; see XDND_LEAVE_DELAY_MS. */
++      this_instance->mHGXdndLeaveAt = g_get_monotonic_time() +
++                                      (gint64) XDND_LEAVE_DELAY_MS * 1000;
++   }
+ }
+ 
+ 
+@@ -1861,6 +2411,9 @@ DnDUIX11::OnGtkSrcDragEnd(const Glib::RefPtr< Gdk::Drag > &drag,
+    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
+    g_debug("%s: DND drag done with ctx %ld\n", __FUNCTION__,
+            this_instance->mDetWnd->Get_Current_Drag_ctx());
++   if (this_instance->LocalXdndIsStaleDrag(drag->gobj())) {
++      return;
++   }
+    if (this_instance->mHGGetFileStatus != DND_FILE_TRANSFER_IN_PROGRESS) {
+       g_debug("%s: reset UI\n", __FUNCTION__);
+       this_instance->ResetUI();
+@@ -1895,6 +2448,9 @@ DnDUIX11::OnGtkSrcDragCancel(const Glib::RefPtr< Gdk::Drag > &drag,
+    DnDUIX11 *this_instance = (DnDUIX11 *)ctx;
+    g_debug("%s: DND cancel for drag %ld with reason %d\n", __FUNCTION__,
+            this_instance->mDetWnd->Get_Current_Drag_ctx(), (int)reason);
++   if (this_instance->LocalXdndIsStaleDrag(drag->gobj())) {
++      return true;
++   }
+    this_instance->ResetUI();
+    return true;
+ }
+diff --git a/services/plugins/dndcp/dragDetWndX11GTK4.cpp b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+index 1b2fa2a..9a06952 100644
+--- a/services/plugins/dndcp/dragDetWndX11GTK4.cpp
++++ b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+@@ -87,6 +87,8 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
+      mTarget(NULL),
+      mUseUInput(false),
+      mUnderWayland(DetWndUnderWayland()),
++     mWarpXPointer(true),
++     mAbove(false),
+      mPlaced(false),
+      mPlacedX(0),
+      mPlacedY(0),
+@@ -893,6 +895,50 @@ DragDetWnd::WaitUntilManaged(unsigned int timeoutMs)  // IN
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::PointerIsOver --
++ *
++ *    Check whether the X server has the pointer at (x, y), within a pixel,
++ *    and over the detection window.
++ *
++ * Results:
++ *    True if both hold.
++ *
++ * Side effects:
++ *    Round trip to the X server.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DragDetWnd::PointerIsOver(int x,   // IN
++                          int y)   // IN
++{
++   Display *display;
++   Window xwindow;
++   Window retRoot, retChild;
++   int rootX, rootY, winX, winY;
++   unsigned int mask;
++
++   if (!GetXWindow(&display, &xwindow)) {
++      return false;
++   }
++
++   /*
++    * The X server learns where the pointer is only while it is over an X
++    * window, and otherwise goes on reporting the last place it saw it. So
++    * the position has to match as well as the window.
++    */
++   XSync(display, False);
++   return XQueryPointer(display, DefaultRootWindow(display), &retRoot,
++                        &retChild, &rootX, &rootY, &winX, &winY, &mask) &&
++          retChild == xwindow &&
++          ABS(rootX - x) <= 1 && ABS(rootY - y) <= 1;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -926,6 +972,107 @@ DragDetWnd::GetXWindow(Display **display,  // OUT
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::WmIsMutter --
++ *
++ *    Whether the X window manager is Mutter, found the EWMH way. The root
++ *    window's _NET_SUPPORTING_WM_CHECK names a window of the window manager,
++ *    which carries the same property pointing to itself and the manager's
++ *    name in _NET_WM_NAME. Mutter sets that name from its context, which
++ *    GNOME Shell creates as "GNOME Shell" and the mutter binary as "Mutter".
++ *
++ *    This reads the X server each time, three round trips, because the
++ *    window manager can be replaced while the plugin runs.
++ *
++ * Results:
++ *    True if the name contains "GNOME Shell" or "Mutter", in any case.
++ *    wmName is set to the name, or left empty if there is none.
++ *
++ * Side effects:
++ *    None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DragDetWnd::WmIsMutter(std::string &wmName)   // OUT
++{
++   GdkDisplay *gdkDisplay = gtk_widget_get_display(GetWnd()->gobj());
++   Display *display;
++   Atom check;
++   Atom actualType;
++   int actualFormat;
++   unsigned long nItems;
++   unsigned long bytesAfter;
++   unsigned char *data;
++   Window wmWindow = None;
++   Window self = None;
++   bool isMutter = false;
++
++   wmName.clear();
++   if (gdkDisplay == NULL || !GDK_IS_X11_DISPLAY(gdkDisplay)) {
++      return false;
++   }
++   display = gdk_x11_display_get_xdisplay(gdkDisplay);
++   check = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
++
++   data = NULL;
++   if (XGetWindowProperty(display, DefaultRootWindow(display), check, 0, 1,
++                          False, XA_WINDOW, &actualType, &actualFormat,
++                          &nItems, &bytesAfter, &data) == Success &&
++       actualType == XA_WINDOW && actualFormat == 32 && nItems == 1) {
++      wmWindow = *(Window *)data;
++   }
++   if (data != NULL) {
++      XFree(data);
++   }
++   if (wmWindow == None) {
++      return false;
++   }
++
++   /*
++    * A window manager that has exited leaves the root property behind, and
++    * its window is then gone or reused, so check that it points to itself.
++    */
++   gdk_x11_display_error_trap_push(gdkDisplay);
++   data = NULL;
++   if (XGetWindowProperty(display, wmWindow, check, 0, 1, False, XA_WINDOW,
++                          &actualType, &actualFormat, &nItems, &bytesAfter,
++                          &data) == Success &&
++       actualType == XA_WINDOW && actualFormat == 32 && nItems == 1) {
++      self = *(Window *)data;
++   }
++   if (data != NULL) {
++      XFree(data);
++   }
++   data = NULL;
++   if (self == wmWindow &&
++       XGetWindowProperty(display, wmWindow,
++                          XInternAtom(display, "_NET_WM_NAME", False), 0, 64,
++                          False, XInternAtom(display, "UTF8_STRING", False),
++                          &actualType, &actualFormat, &nItems, &bytesAfter,
++                          &data) == Success &&
++       actualFormat == 8 && data != NULL) {
++      wmName.assign((const char *)data, nItems);
++   }
++   if (data != NULL) {
++      XFree(data);
++   }
++   gdk_x11_display_error_trap_pop_ignored(gdkDisplay);
++
++   if (!wmName.empty()) {
++      char *folded = g_utf8_casefold(wmName.c_str(), -1);
++
++      isMutter = strstr(folded, "gnome shell") != NULL ||
++                 strstr(folded, "mutter") != NULL;
++      g_free(folded);
++   }
++   return isMutter;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -972,6 +1119,45 @@ DragDetWnd::SendWmState(long action,   // IN: 1 to add, 0 to remove
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::SetAbove --
++ *
++ *    Ask the window manager to keep the detection window above other
++ *    windows, or to stop doing so.
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    Sends a _NET_WM_STATE client message to the root window.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DragDetWnd::SetAbove(bool above)   // IN
++{
++   Display *display;
++   Window xwindow;
++
++   /*
++    * The add is sent every time, because the window manager drops a
++    * window's _NET_WM_STATE when the window is withdrawn, and an earlier add
++    * does not survive the next hide. A remove is sent only after an add.
++    */
++   if (!GetXWindow(&display, &xwindow) || (!above && !mAbove)) {
++      return;
++   }
++
++   SendWmState(above ? 1 : 0,
++               XInternAtom(display, "_NET_WM_STATE_ABOVE", False), None, 2);
++   mAbove = above;
++   g_debug("%s: %s\n", __FUNCTION__, above ? "above other windows" : "normal stacking");
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -1331,6 +1517,7 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
+        * drag ends in GDK_DRAG_CANCEL_NO_TARGET.
+        */
+       if (asDropTarget && mUnderWayland) {
++
+          WaitUntilManaged(DET_WND_MANAGE_TIMEOUT_MS);
+       }
+       g_debug("%s: show at (%d, %d, %d, %d)\n", __FUNCTION__, x, y, DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
+@@ -1632,9 +1819,18 @@ DragDetWnd::SimulateXEvents(const bool showWidget, const bool buttonEvent,
+         * detection window is never offered the drag.
+         *
+         * Warp the X pointer to the same coordinates so both agree.
++        *
++        * A host to guest XDND drag needs the opposite. Xwayland carries out
++        * a warp from the client under the pointer by locking the Wayland
++        * pointer, and Mutter's pointer then stays on the detection window
++        * while only Xwayland's moves. Mutter bridges an X11 drag to Wayland
++        * clients by following its own pointer, so the drag never reaches
++        * one. The caller turns the warp off for that drag.
+         */
+-       XWarpPointer(dndXDisplay, None, DefaultRootWindow(dndXDisplay),
+-                    0, 0, 0, 0, x + 1, y + 1);
++       if (mWarpXPointer) {
++          XWarpPointer(dndXDisplay, None, DefaultRootWindow(dndXDisplay),
++                       0, 0, 0, 0, x + 1, y + 1);
++       }
+ #endif
+    } else {
+        XTestFakeMotionEvent(dndXDisplay, -1, x, y, CurrentTime);
+-- 
+2.55.0
+

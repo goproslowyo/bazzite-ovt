@@ -1,0 +1,1039 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:10 -0700
+Subject: [PATCH 12/21] dndcp: Paste host files through vmblock in a Wayland
+ session
+
+A host file paste publishes URIs under the vmblock mount at once, and
+the transfer starts only when an application opens one of them, as in
+the X11 backend. The backend brings up vmblock with the descriptor that
+vmware-user-suid-wrapper passes. A monitor thread waits on the vmblock
+notify path of the staging directory and reports the open to the main
+loop, which asks the host for the files. The main loop owns the block,
+the staging directory and the RPC channel, so the thread only reports,
+with the generation of the block it watched, and a stale report is
+dropped. Without vmblock the paste is declined, since copying every host
+file selection into the guest up front would cost more than it saves. A
+new host clip removes the block of the previous one. Otherwise the
+staging directory, which is reused while it is empty, could not be
+blocked again.
+
+Every name from the host passes LocalIsSafeStagingName(), and each URI
+escapes every byte a receiver could read as syntax. A file paste is
+offered as text/uri-list, x-special/gnome-copied-files and
+application/x-kde-cutselection. With only a text/uri-list, Thunar keeps
+Paste greyed out, because nothing in the list says whether the selection
+is a copy or a cut. The URIs carry the file:// authority. wl-copy can
+serve only one of these, and gets the GNOME rendering. The backend
+remembers the list it published, so that the next host request does not
+take it for a guest copy and size paths that are still blocked.
+
+When the host sends file contents rather than paths,
+LocalPrepareFileContents() writes them to a staging directory, and the
+paths are published the same way without vmblock, since the data has
+already arrived. The backend now advertises every copy and paste format.
+
+Tested by hand with the whole series on Bazzite 44 (Fedora 44), against
+VMware Workstation Pro 26H1u1, build 26.0.1.25688693, on Windows 10 Pro
+22H2. On KDE Plasma 6.7.5 text, PNG, RTF and files went both ways. On
+sway 1.11 file pastes into Thunar and PCManFM, host text, and a guest to
+host file copy were tested. On GNOME 50.3 (Bluefin 44) text and files
+went both ways, and a host image arrived as a file, through the X
+selection in both directions. Only the GTK4 configuration was built.
+---
+ .../plugins/dndcp/copyPasteDnDWayland.cpp     |  39 +-
+ services/plugins/dndcp/copyPasteUIWayland.cpp | 680 +++++++++++++++++-
+ services/plugins/dndcp/copyPasteUIWayland.h   |  54 +-
+ .../dndcp/dndGuestBase/copyPasteDnDWayland.h  |   3 +
+ 4 files changed, 763 insertions(+), 13 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+index e9246f9..4586367 100644
+--- a/services/plugins/dndcp/copyPasteDnDWayland.cpp
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+@@ -36,6 +36,7 @@
+ 
+ extern "C" {
+ #include "dndCPMsgV4.h"
++#include "vmblock.h"
+ }
+ 
+ 
+@@ -53,6 +54,7 @@ CopyPasteDnDWayland::CopyPasteDnDWayland()
+  : m_ctx(NULL),
+    m_copyPasteUI(NULL),
+    m_dndUI(NULL),
++   m_blockInited(false),
+ #if defined(GTK3)
+    m_main(NULL),
+ #endif
+@@ -82,6 +84,10 @@ CopyPasteDnDWayland::~CopyPasteDnDWayland()
+       delete m_dndUI;
+       m_dndUI = NULL;
+    }
++   if (m_blockInited && DnD_BlockIsReady(&m_blockCtrl)) {
++      DnD_UninitializeBlocking(&m_blockCtrl);
++      m_blockInited = false;
++   }
+ #if defined(GTK3)
+    delete m_main;
+ #endif
+@@ -94,8 +100,8 @@ CopyPasteDnDWayland::~CopyPasteDnDWayland()
+  * CopyPasteDnDWayland::Init --
+  *
+  *    Initialize the Wayland platform DnD/CP. Pin GDK to its X11 backend for
+- *    drag and drop. The copy/paste UI is created lazily in RegisterCP,
+- *    mirroring the X11 backend.
++ *    drag and drop and bring up vmblock. The copy/paste UI is created lazily
++ *    in RegisterCP, mirroring the X11 backend.
+  *
+  *    Gtk::Application and Gtk::Main call gtk_init(), which exits the process
+  *    when it cannot open a display, and a Wayland session may have no
+@@ -140,6 +146,26 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
+                 __FUNCTION__);
+    }
+ 
++   /*
++    * Bring up the vmblock subsystem. vmware-user-suid-wrapper opens
++    * VMBLOCK_FUSE_DEVICE as root and passes the descriptor as --blockFd, so
++    * the common path is CompleteBlockInitialization; InitializeBlocking is the
++    * fallback for a daemon started without the wrapper, and will fail without
++    * privilege. Host to guest file paste needs vmblock. It lets this backend
++    * publish a URI list at once and stall the reader until the bytes arrive.
++    */
++   if (!m_blockInited && ctx != NULL) {
++      memset(&m_blockCtrl, 0, sizeof m_blockCtrl);
++      m_blockCtrl.fd = ctx->blockFD;
++      m_blockCtrl.fd >= 0 ?
++         DnD_CompleteBlockInitialization(m_blockCtrl.fd, &m_blockCtrl) :
++         DnD_InitializeBlocking(&m_blockCtrl);
++      m_blockInited = true;
++      g_debug("%s: vmblock %s (fd %d)\n", __FUNCTION__,
++              DnD_BlockIsReady(&m_blockCtrl) ? "ready" : "unavailable",
++              m_blockCtrl.fd);
++   }
++
+    return TRUE;
+ }
+ 
+@@ -392,8 +418,8 @@ CopyPasteDnDWayland::SetDnDAllowed(bool allowed)
+  *
+  * CopyPasteDnDWayland::GetCaps --
+  *
+- *    Report what this backend supports, which is copy and paste of text, RTF,
+- *    PNG images and file lists.
++ *    Report what this backend supports, which is copy and paste of every
++ *    format the X11 backend handles.
+  *
+  *    Copy and paste owns the Wayland selection directly, so one selection can
+  *    carry rich text and its plain rendering at once.
+@@ -406,10 +432,7 @@ CopyPasteDnDWayland::GetCaps()
+ {
+    return DND_CP_CAP_VALID |
+           DND_CP_CAP_CP |
+-          DND_CP_CAP_PLAIN_TEXT_CP |
+-          DND_CP_CAP_RTF_CP |
+-          DND_CP_CAP_IMAGE_CP |
+-          DND_CP_CAP_FILE_CP |
++          DND_CP_CAP_FORMATS_CP |
+           DND_CP_CAP_ACTIVE_CP |
+           DND_CP_CAP_BIG_BUFFER;
+ }
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+index 597bc04..7077273 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.cpp
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp
+@@ -50,6 +50,7 @@
+ #include "vmware.h"
+ #include "copyPasteUIWayland.h"
+ #include "waylandClipboard.h"
++#include "copyPasteDnDUtil.h"
+ #include "guestDnDCPMgr.hh"
+ #include "dndFileList.hh"
+ #include "dndMsg.h"
+@@ -67,6 +68,13 @@ extern "C" {
+ }
+ 
+ 
++/* What FileBlockMonitorThread passes to the main loop. */
++typedef struct {
++   CopyPasteUIWayland *cp;
++   unsigned int generation;
++} WaylandPasteReport;
++
++
+ /*
+  * One request from the host can ask for several types in turn. Each read is
+  * bounded, but a sequence of them is not, and this runs on the main loop that
+@@ -83,6 +91,13 @@ extern "C" {
+  */
+ #define CP_WLCOPY_TIMEOUT_MS 5000
+ 
++/*
++ * KDE keeps the copy or cut distinction out of the URI list, in a target of
++ * its own that holds "1" for a cut and "0" for a copy.
++ */
++#define FCP_TARGET_NAME_KDE_CUT_SELECTION "application/x-kde-cutselection"
++#define FCP_KDE_CUT_SELECTION_COPY        "0"
++
+ /*
+  * False once CopyPasteUIWayland::Init() has found that wl-copy is not
+  * installed, so that the fallback does not try to run it for every host clip.
+@@ -1070,13 +1085,20 @@ CopyPasteUIWayland::CopyPasteUIWayland()
+    mSelectionGeneration(0),
+    mReadGeneration(G_MAXUINT64),
+    mRetriedGeneration(G_MAXUINT64),
+-   mBlockCtrl(NULL)
++   mBlockCtrl(NULL),
++   mBlockAdded(false),
++   mBlockGeneration(0),
++   mThread(0),
++   mThreadStarted(false),
++   mThreadInited(false)
+ {
+    GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
+    ASSERT(p);
+    mCP = p->GetCopyPasteMgr();
+    ASSERT(mCP);
+    CPClipboard_Init(&mClipboard);
++   mThreadParams.mainContext = NULL;
++   mThreadParams.pendingPaste = NULL;
+ }
+ 
+ 
+@@ -1102,7 +1124,36 @@ CopyPasteUIWayland::~CopyPasteUIWayland()
+       CopyPasteXReaderClose();
+       mXReaderOpen = false;
+    }
++
++   /*
++    * Remove the block first. The monitor thread may be blocked in a read on
++    * the notify path, and removing the block ends that read. Joining before
++    * that would wait for a paste that may never happen.
++    */
++   RemoveHGBlock();
++
++   TerminateThread();
++
++   /*
++    * Destroy any report the thread queued before the join. It would
++    * otherwise run after this object is gone.
++    */
++   if (mThreadParams.pendingPaste != NULL) {
++      g_source_destroy(mThreadParams.pendingPaste);
++      g_source_unref(mThreadParams.pendingPaste);
++      mThreadParams.pendingPaste = NULL;
++   }
++   if (mThreadParams.mainContext != NULL) {
++      g_main_context_unref(mThreadParams.mainContext);
++      mThreadParams.mainContext = NULL;
++   }
++
+    WaylandClipboard_Exit();
++   if (mThreadInited) {
++      pthread_cond_destroy(&mThreadParams.fileBlockCond);
++      pthread_mutex_destroy(&mThreadParams.fileBlockMutex);
++      mThreadInited = false;
++   }
+    CPClipboard_Destroy(&mClipboard);
+ }
+ 
+@@ -1112,8 +1163,8 @@ CopyPasteUIWayland::~CopyPasteUIWayland()
+  *
+  * CopyPasteUIWayland::Init --
+  *
+- *    Choose how to own and read the local selection and connect to the
+- *    common-layer copy/paste signals.
++ *    Choose how to own and read the local selection, connect to the
++ *    common-layer copy/paste signals and start the vmblock monitor thread.
+  *    The RPC transport runs on the toolbox GLib main loop.
+  *
+  *-----------------------------------------------------------------------------
+@@ -1174,6 +1225,33 @@ CopyPasteUIWayland::Init()
+    mCP->destRequestClipChanged.connect(
+       sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalClipboard));
+ 
++   mCP->getFilesDoneChanged.connect(
++      sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalFilesDone));
++
++   /*
++    * The monitor thread lets a host to guest file paste wait until the user
++    * pastes. Start it once. It waits on its condition variable until a block
++    * is armed.
++    */
++   pthread_mutex_init(&mThreadParams.fileBlockMutex, NULL);
++   pthread_cond_init(&mThreadParams.fileBlockCond, NULL);
++   mThreadInited = true;
++   mThreadParams.fileBlockCondExit = false;
++   mThreadParams.cp = this;
++   mThreadParams.fileBlockName.clear();
++   mThreadParams.fileBlockGeneration = 0;
++   /* Init runs on the main loop, where paste reports must be dispatched. */
++   mThreadParams.mainContext = g_main_context_ref_thread_default();
++   mThreadParams.pendingPaste = NULL;
++   if (pthread_create(&mThread, NULL,
++                      CopyPasteUIWayland::FileBlockMonitorThread,
++                      &mThreadParams) == 0) {
++      mThreadStarted = true;
++   } else {
++      g_warning("%s: could not start the file block monitor thread; "
++                "host -> guest file paste will not work\n", __FUNCTION__);
++   }
++
+    mInited = true;
+    return true;
+ }
+@@ -1250,6 +1328,14 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+     */
+    ClearLastClipboard();
+ 
++   /*
++    * Drop any block left over from a previous file clip. Without this,
++    * DnD_CreateStagingDirectory() hands back the same still-empty directory
++    * on the next file copy and AddBlock refuses it, so only the first file
++    * paste of a session would ever work.
++    */
++   RemoveHGBlock();
++
+    /*
+     * Log every format the host offered. The host may attach a text rendering,
+     * such as a filename or URL, to an image copy, so the order in which the
+@@ -1261,6 +1347,27 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+            CPClipboard_ItemExists(clip, CPFORMAT_RTF)      ? " rtf"   : "",
+            CPClipboard_ItemExists(clip, CPFORMAT_FILELIST) ? " files" : "");
+ 
++   /*
++    * Files first. A file selection normally also carries a text rendering of
++    * the paths, and consuming that would turn a file paste into a paste of
++    * filenames. copyPasteUIX11.cpp checks text first here, and files first
++    * only in the guest to host direction.
++    */
++   if (CPClipboard_ItemExists(clip, CPFORMAT_FILELIST) &&
++       SetRemoteFileList(clip)) {
++      return;
++   }
++
++   /*
++    * File contents rather than paths. The host sends the bytes when the
++    * source has no file on disk to point at. Write them out and publish the
++    * staged paths as for any other file list.
++    */
++   if (CPClipboard_ItemExists(clip, CPFORMAT_FILECONTENTS) &&
++       SetRemoteFileContents(clip)) {
++      return;
++   }
++
+    /*
+     * Offer every format the host sent in one selection, so an application
+     * asking for rich text gets RTF while one asking for plain text gets the
+@@ -1501,7 +1608,9 @@ CopyPasteUIWayland::GetLocalClipboard(void)
+    /*
+     * When this client owns the selection, the selection holds what the host
+     * sent, so there is nothing new to report. Reading it back would send the
+-    * host its own data. On the
++    * host its own data. For a file paste the uri-list also points into a
++    * staging directory that is still blocked, and reading it would stall
++    * this main loop and the RPC channel that lifts the block. On the
+     * fallback this process owns the X selection after
+     * CopyPasteXWriterOffer(). GDK answers a read of it from this main loop,
+     * which the read holds, so the read would also wait out the budget. A
+@@ -2317,6 +2426,569 @@ CopyPasteUIWayland::GetLocalFileList(gint64 deadline)  // IN: monotonic, us
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::FileBlockMonitorThread --
++ *
++ *    Wait for the user to paste. After SetRemoteFileList() publishes a URI
++ *    list pointing into the vmblock file system, nothing has been transferred
++ *    yet. When the pasting application opens one of those paths,
++ *    vmblock-fuse stalls its open(2) and the read(2) here returns. The main
++ *    loop then asks the host for the bytes. A host-side copy of a large file
++ *    therefore costs nothing until it is pasted.
++ *
++ *    Ported from CopyPasteUIX11::FileBlockMonitorThread.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void *
++CopyPasteUIWayland::FileBlockMonitorThread(void *arg)  // IN
++{
++   WaylandThreadParams *params = (WaylandThreadParams *) arg;
++
++   pthread_mutex_lock(&params->fileBlockMutex);
++   while (!params->fileBlockCondExit) {
++      /*
++       * Test the predicate before waiting and again after every wake.
++       * TerminateThread() can signal while this thread is in the read below
++       * rather than on the condition variable. A wait entered without this
++       * check would miss that signal, and the join would never return.
++       */
++      if (params->fileBlockName.empty()) {
++         g_debug("%s: waiting for a block to monitor\n", __FUNCTION__);
++         pthread_cond_wait(&params->fileBlockCond, &params->fileBlockMutex);
++         continue;
++      }
++
++      /*
++       * The read below blocks until the block is touched or lifted, which may
++       * be never. Take a copy of the path and drop the mutex first, or
++       * TerminateThread() cannot acquire it to ask this thread to exit.
++       */
++      std::string blockName = params->fileBlockName;
++      unsigned int generation = params->fileBlockGeneration;
++
++      /*
++       * Consume the request. The path is armed for this pass only, so a wake
++       * with no new block sends the thread back to waiting rather than
++       * reopening the path just handled.
++       */
++      params->fileBlockName.clear();
++      pthread_mutex_unlock(&params->fileBlockMutex);
++
++      int fd = open(blockName.c_str(), O_RDONLY);
++      if (fd < 0) {
++         g_debug("%s: failed to open %s: %s\n", __FUNCTION__,
++                 blockName.c_str(), g_strerror(errno));
++         pthread_mutex_lock(&params->fileBlockMutex);
++         continue;
++      }
++
++      char buf[sizeof(VMBLOCK_FUSE_READ_RESPONSE)];
++      ssize_t size = read(fd, buf, sizeof buf);
++
++      /*
++       * The read above blocks until another process touches the blocked path
++       * or the block is lifted. The content of the response does not matter.
++       */
++      g_debug("%s: notify read returned %" FMTSZ "d\n", __FUNCTION__, size);
++
++      close(fd);
++
++      /*
++       * Lock before checking the exit flag. The destructor removes the block,
++       * which ends the read, and only then asks this thread to exit, so the
++       * request can arrive at any point above.
++       */
++      pthread_mutex_lock(&params->fileBlockMutex);
++      if (params->fileBlockCondExit) {
++         break;
++      }
++
++      /*
++       * Report to the main loop, with the generation of the block this read
++       * was for. The block may have been lifted or replaced by the time the
++       * report is dispatched. This report replaces any earlier one that has
++       * not been dispatched.
++       */
++      WaylandPasteReport *report = g_new(WaylandPasteReport, 1);
++      report->cp = params->cp;
++      report->generation = generation;
++
++      if (params->pendingPaste != NULL) {
++         g_source_destroy(params->pendingPaste);
++         g_source_unref(params->pendingPaste);
++      }
++      params->pendingPaste = g_idle_source_new();
++      g_source_set_callback(params->pendingPaste,
++                            CopyPasteUIWayland::PasteObserved, report,
++                            g_free);
++      g_source_attach(params->pendingPaste, params->mainContext);
++   }
++   pthread_mutex_unlock(&params->fileBlockMutex);
++   return NULL;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::PasteObserved --
++ *
++ *    The main loop part of FileBlockMonitorThread(). A reader touched a
++ *    blocked path, so ask the host for the files if the block the thread was
++ *    watching is still in place.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++CopyPasteUIWayland::PasteObserved(gpointer data)  // IN: WaylandPasteReport
++{
++   WaylandPasteReport *report = (WaylandPasteReport *) data;
++   CopyPasteUIWayland *cp = report->cp;
++
++   pthread_mutex_lock(&cp->mThreadParams.fileBlockMutex);
++   if (cp->mThreadParams.pendingPaste == g_main_current_source()) {
++      g_source_unref(cp->mThreadParams.pendingPaste);
++      cp->mThreadParams.pendingPaste = NULL;
++   }
++   pthread_mutex_unlock(&cp->mThreadParams.fileBlockMutex);
++
++   if (report->generation == cp->mBlockGeneration && cp->mBlockAdded) {
++      g_debug("%s: paste observed, requesting files\n", __FUNCTION__);
++      cp->RequestFiles();
++   } else {
++      g_debug("%s: block already removed or replaced, nothing to request\n",
++              __FUNCTION__);
++   }
++   return G_SOURCE_REMOVE;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::TerminateThread --
++ *
++ *    Signal the monitor thread to exit and join it.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::TerminateThread(void)
++{
++   if (!mThreadStarted) {
++      return;
++   }
++   pthread_mutex_lock(&mThreadParams.fileBlockMutex);
++   mThreadParams.fileBlockCondExit = true;
++   pthread_cond_signal(&mThreadParams.fileBlockCond);
++   pthread_mutex_unlock(&mThreadParams.fileBlockMutex);
++   pthread_join(mThread, NULL);
++   mThreadStarted = false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandPathToUri --
++ *
++ *    Turn an absolute path into a file:// URI for a uri-list.
++ *
++ *    Escape every byte a receiver would read as syntax. Otherwise CR or LF
++ *    ends the entry, # or ? cuts the path short, and a literal "%2E%2E"
++ *    decodes to "..". The set is the one CopyPasteUIX11::GetNextPath()
++ *    escapes, plus the other control characters and space, which a URI may
++ *    not contain unescaped.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static std::string
++CopyPasteWaylandPathToUri(const std::string &path)  // IN
++{
++   static const char Dec2Hex[] = {
++      '0', '1', '2', '3', '4', '5', '6', '7',
++      '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
++   };
++   std::string uri = DND_URI_LIST_PRE;
++   size_t i;
++
++   for (i = 0; i < path.size(); i++) {
++      unsigned char ubyte = (unsigned char) path[i];
++
++      if (ubyte == '#' ||   /* Fragment identifier delimiter */
++          ubyte == '?' ||   /* Query string delimiter */
++          ubyte == '*' ||   /* Special significance in some schemes */
++          ubyte == '!' ||   /* Special significance in some schemes */
++          ubyte == '%' ||   /* Escape character */
++          ubyte == ' ' ||   /* Not allowed in a URI */
++          ubyte < 0x20 ||   /* Controls, including CR and LF */
++          ubyte == 0x7f ||
++          ubyte >= 0x80) {  /* UTF-8 encoding bytes */
++         uri += '%';
++         uri += Dec2Hex[ubyte >> 4];
++         uri += Dec2Hex[ubyte & 0xF];
++      } else {
++         uri += (char) ubyte;
++      }
++   }
++   return uri;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandOfferFileList --
++ *
++ *    Publish file URIs as a local clipboard selection, on the X selection
++ *    through xClipboard when it is not NULL and the protocol is absent.
++ *    Return in published the rendering that a later read of the selection
++ *    yields. The caller caches it to recognise its own selection.
++ *
++ *    A text/uri-list on its own is not enough. Thunar leaves Paste greyed out
++ *    for a selection that offers only that, however the URIs are spelled,
++ *    because the selection does not say whether it is a copy or a cut. GNOME
++ *    puts a "copy" or "cut" line ahead of the URIs. KDE puts it in a target
++ *    of its own. Offer all three renderings, and each application takes the
++ *    one it understands.
++ *
++ *    The URIs carry the file:// authority. A file manager may reject the
++ *    spelling without it, and file managers put "file:///path" on their own
++ *    clipboards, not "file:/path".
++ *
++ *    Neither GDK nor the data control code opens the paths while serving
++ *    the list. They may be under a vmblock block that the main loop lifts.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandOfferFileList(const std::vector<std::string> &uris,  // IN
++                              gpointer xClipboard,                   // IN/OPT
++                              std::string &published)                // OUT
++{
++   std::string plainList;
++   std::string gnomeList = "copy\n";
++
++   published.clear();
++   for (size_t i = 0; i < uris.size(); i++) {
++      published += uris[i];
++      published += DND_URI_LIST_POST;
++      if (i > 0) {
++         plainList += "\n";
++      }
++      plainList += uris[i];
++   }
++   gnomeList += plainList;
++
++   WaylandClipItem items[3];
++
++   items[0].mimeType = FCP_TARGET_NAME_URI_LIST;
++   items[0].data = published.c_str();
++   items[0].size = published.size();
++   items[1].mimeType = FCP_TARGET_NAME_GNOME_COPIED_FILES;
++   items[1].data = gnomeList.c_str();
++   items[1].size = gnomeList.size();
++   items[2].mimeType = FCP_TARGET_NAME_KDE_CUT_SELECTION;
++   items[2].data = FCP_KDE_CUT_SELECTION_COPY;
++   items[2].size = sizeof FCP_KDE_CUT_SELECTION_COPY - 1;
++
++   if (WaylandClipboard_IsAvailable()) {
++      return WaylandClipboard_Offer(items, G_N_ELEMENTS(items));
++   }
++   if (xClipboard != NULL &&
++       CopyPasteXWriterOffer(xClipboard, items, G_N_ELEMENTS(items))) {
++      return true;
++   }
++
++   /*
++    * wl-copy, as of wl-clipboard 2.2, serves one payload under one type, and
++    * a second wl-copy would replace the selection rather than add to it. No
++    * target can infer the operation, so keep the rendering that carries it
++    * and drop the others. GNOME reads this target. A client that asks only
++    * for text/uri-list finds nothing to paste.
++    */
++   published = plainList;
++   return CopyPasteWaylandSetData(FCP_TARGET_NAME_GNOME_COPIED_FILES,
++                                  gnomeList.c_str(), gnomeList.size());
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::RemoveHGBlock --
++ *
++ *    Lift the block on the staging directory, if one is in place. A block
++ *    left behind by a paste that was never published stalls anything that
++ *    looks at the directory, and makes the next AddBlock on it fail.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::RemoveHGBlock(void)
++{
++   if (!mBlockAdded) {
++      return;
++   }
++   mBlockAdded = false;
++   if (mBlockCtrl != NULL && DnD_BlockIsReady(mBlockCtrl)) {
++      g_debug("%s: removing block for %s\n", __FUNCTION__,
++              mHGStagingDir.c_str());
++      mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::SetRemoteFileList --
++ *
++ *    The host sent a file list. Publish a text/uri-list pointing into the
++ *    vmblock file system, so that the paste completes at once and the
++ *    transfer waits until an application reads the files.
++ *
++ *    Returns true when a URI list was installed on the local clipboard.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++CopyPasteUIWayland::SetRemoteFileList(const CPClipboard *clip)  // IN
++{
++   void *buf = NULL;
++   size_t sz = 0;
++
++   if (!CPClipboard_GetItem(clip, CPFORMAT_FILELIST, &buf, &sz) ||
++       buf == NULL || sz == 0) {
++      return false;
++   }
++
++   if (mBlockCtrl == NULL || !DnD_BlockIsReady(mBlockCtrl)) {
++      /*
++       * Without vmblock nothing can make a reader wait until the data
++       * arrives. Copying every host file selection into the guest up front
++       * would cost more than not supporting the paste, so decline.
++       */
++      g_warning("%s: vmblock is not available, skipping file paste. "
++                "Check that run-vmblock\\x2dfuse.mount is active and that "
++                "vmtoolsd -n vmusr was started with --blockFd.\n",
++                __FUNCTION__);
++      return false;
++   }
++
++   DnDFileList flist;
++   if (!flist.FromCPClipboard(buf, sz)) {
++      g_warning("%s: could not decode the host file list\n", __FUNCTION__);
++      return false;
++   }
++
++   /* A run of NUL-delimited relative paths. */
++   std::string relPaths = flist.GetRelPathsStr();
++   if (relPaths.empty()) {
++      g_warning("%s: host file list carries no paths\n", __FUNCTION__);
++      return false;
++   }
++
++   char *stagingDir = DnD_CreateStagingDirectory();
++   if (stagingDir == NULL) {
++      g_warning("%s: could not create a staging directory\n", __FUNCTION__);
++      return false;
++   }
++   mHGStagingDir = stagingDir;
++   free(stagingDir);
++
++   mBlockAdded = mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
++   if (!mBlockAdded) {
++      /*
++       * A block from an abandoned transfer may still be on this directory;
++       * the staging directory is reused whenever it is still empty. Drop it
++       * and retry once before giving up.
++       */
++      g_debug("%s: AddBlock failed for %s, retrying after RemoveBlock\n",
++              __FUNCTION__, mHGStagingDir.c_str());
++      mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
++      mBlockAdded = mBlockCtrl->AddBlock(mBlockCtrl->fd,
++                                         mHGStagingDir.c_str());
++   }
++
++   if (!mBlockAdded) {
++      g_warning("%s: failed to add a block for %s\n", __FUNCTION__,
++                mHGStagingDir.c_str());
++      return false;
++   }
++   g_debug("%s: added block for %s\n", __FUNCTION__, mHGStagingDir.c_str());
++
++   /* The last path component names the staging directory in the block root. */
++   std::string stagingName = mHGStagingDir;
++   while (!stagingName.empty() && stagingName[stagingName.size() - 1] == '/') {
++      stagingName.erase(stagingName.size() - 1);
++   }
++   size_t slash = stagingName.rfind('/');
++   if (slash != std::string::npos) {
++      stagingName = stagingName.substr(slash + 1);
++   }
++
++   /* The URIs point under the vmblock root. */
++   std::vector<std::string> uris;
++   size_t off = 0;
++   while (off < relPaths.size()) {
++      std::string name(relPaths.c_str() + off);
++
++      if (name.empty()) {
++         break;
++      }
++      off += name.size() + 1;
++
++      /*
++       * The host chooses these names. A ".." component or an absolute path
++       * would point the URI outside the staging directory, where the block
++       * does not apply.
++       */
++      if (!LocalIsSafeStagingName(name.c_str(), name.size() + 1)) {
++         g_warning("%s: rejecting an unsafe file list entry\n",
++                   __FUNCTION__);
++         RemoveHGBlock();
++         return false;
++      }
++
++      uris.push_back(CopyPasteWaylandPathToUri(
++         std::string(mBlockCtrl->blockRoot) + "/" + stagingName + "/" + name));
++   }
++
++   if (uris.empty()) {
++      g_warning("%s: built an empty URI list\n", __FUNCTION__);
++      RemoveHGBlock();
++      return false;
++   }
++
++   /* Arm the monitor before publishing, so that it sees the first paste. */
++   mBlockGeneration++;
++   pthread_mutex_lock(&mThreadParams.fileBlockMutex);
++   mThreadParams.fileBlockCondExit = false;
++   mThreadParams.fileBlockName = std::string(VMBLOCK_FUSE_NOTIFY_ROOT) + "/" +
++                                 stagingName;
++   mThreadParams.fileBlockGeneration = mBlockGeneration;
++   pthread_cond_signal(&mThreadParams.fileBlockCond);
++   pthread_mutex_unlock(&mThreadParams.fileBlockMutex);
++
++   g_debug("%s: publishing %d file URI(s)\n", __FUNCTION__, (int) uris.size());
++
++   std::string uriList;
++   if (!CopyPasteWaylandOfferFileList(uris, XWriterClipboard(), uriList)) {
++      g_warning("%s: could not install the URI list\n", __FUNCTION__);
++      pthread_mutex_lock(&mThreadParams.fileBlockMutex);
++      mThreadParams.fileBlockName.clear();
++      pthread_mutex_unlock(&mThreadParams.fileBlockMutex);
++      RemoveHGBlock();
++      return false;
++   }
++
++   /*
++    * Remember the list just published. With a stale cache the next host
++    * request would take this uri-list for a new guest copy and size every
++    * path in it. Those paths are under a block that only the main loop lifts,
++    * and the sizing would stall the main loop.
++    */
++   CopyPasteWaylandParseUriList(uriList, mLastClipboardFiles);
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::SetRemoteFileContents --
++ *
++ *    Handle a host clipboard that carries file contents instead of paths.
++ *    LocalPrepareFileContents() writes the bytes into a staging directory,
++ *    records it as the one the clipboard offers, and returns the paths it
++ *    created, which are published as a uri-list.
++ *
++ *    No vmblock is involved. Unlike a file list, the data has already
++ *    arrived, so no reader has to wait for it.
++ *
++ * Results:
++ *    true if a selection was installed.
++ *
++ * Side effects:
++ *    Writes files into the staging directory and takes the local selection.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++CopyPasteUIWayland::SetRemoteFileContents(const CPClipboard *clip)  // IN
++{
++   std::vector<utf::string> paths;
++   std::vector<std::string> uris;
++   std::string uriList;
++
++   if (!mCP->CheckCapability(DND_CP_CAP_FILE_CONTENT_CP)) {
++      g_debug("%s: file contents copy/paste not in caps\n", __FUNCTION__);
++      return false;
++   }
++   if (!LocalPrepareFileContents(clip, paths) || paths.empty()) {
++      g_debug("%s: could not write the file contents out\n", __FUNCTION__);
++      return false;
++   }
++
++   for (size_t i = 0; i < paths.size(); i++) {
++      uris.push_back(CopyPasteWaylandPathToUri(paths[i].c_str()));
++   }
++
++   g_debug("%s: staged %d file(s) from contents\n", __FUNCTION__,
++           (int) paths.size());
++
++   if (!CopyPasteWaylandOfferFileList(uris, XWriterClipboard(), uriList)) {
++      g_warning("%s: could not install the staged file list\n", __FUNCTION__);
++      return false;
++   }
++   CopyPasteWaylandParseUriList(uriList, mLastClipboardFiles);
++   return true;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::GetLocalFilesDone --
++ *
++ *    The host finished or abandoned the requested transfer. Lift the block so
++ *    that the stalled reader continues.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
++{
++   g_debug("%s: success %d\n", __FUNCTION__, success);
++
++   RemoveHGBlock();
++
++   if (success) {
++      /*
++       * Ask for the staging dir to be deleted on next reboot, as the X11
++       * backends do. On POSIX, File_UnlinkDelayed() unlinks at once and
++       * fails on a directory, so this removes nothing.
++       */
++      DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
++   } else {
++      mHGStagingDir.clear();
++   }
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.h b/services/plugins/dndcp/copyPasteUIWayland.h
+index 2a18969..1e983c5 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.h
++++ b/services/plugins/dndcp/copyPasteUIWayland.h
+@@ -29,7 +29,7 @@
+  * owner. This is the counterpart of copyPasteUIX11.h for the Wayland
+  * platform.
+  *
+- * Text, RTF and PNG images are supported, and file lists from the guest.
++ * Text, RTF, PNG images, file lists and file contents are supported.
+  */
+ 
+ #ifndef __COPYPASTE_UI_WAYLAND_H__
+@@ -37,6 +37,7 @@
+ 
+ #include <string>
+ #include <vector>
++#include <pthread.h>
+ #include <glib.h>
+ #include <gdk/gdk.h>
+ #include <sigc++/trackable.h>
+@@ -51,6 +52,30 @@ extern "C" {
+ 
+ #include "guestCopyPaste.hh"
+ 
++class CopyPasteUIWayland;
++
++/*
++ * Parameters for the vmblock notify monitor thread. The thread blocks in
++ * read(2) on a path under VMBLOCK_FUSE_NOTIFY_ROOT. The read returns as soon
++ * as another process touches the corresponding blocked path, which means the
++ * user pasted and the transfer should start.
++ *
++ * The thread only reports the paste to the main loop. The main loop owns the
++ * block state, the staging directory and the RPC layer, and can change or
++ * free any of them at any moment.
++ */
++struct WaylandThreadParams
++{
++   pthread_mutex_t fileBlockMutex;
++   pthread_cond_t fileBlockCond;
++   bool fileBlockCondExit;
++   CopyPasteUIWayland *cp;         /* Only handed back to the main loop. */
++   std::string fileBlockName;
++   unsigned int fileBlockGeneration;
++   GMainContext *mainContext;      /* Constant while the thread runs. */
++   GSource *pendingPaste;          /* Report not yet dispatched, if any. */
++};
++
+ class CopyPasteUIWayland
+    : public sigc::trackable
+ {
+@@ -66,6 +91,16 @@ public:
+    { mBlockCtrl = blockCtrl; }
+ 
+ private:
++   /*
++    * Ask the host to transfer the files into the staging directory whose URIs
++    * are already published. The directory is passed explicitly. With an
++    * empty argument SetupDestDir() calls DnD_CreateStagingDirectory(), which
++    * happens to return the same still-empty directory, and the X11 backend
++    * relies on that. Call from the main loop only.
++    */
++   void RequestFiles()
++   { mCP->SrcUIRequestFiles(mHGStagingDir); }
++
+    /* Called when the host sends new clipboard contents. */
+    void GetRemoteClipboardCB(const CPClipboard *clip);
+    /* Called when the host asks for the guest clipboard. */
+@@ -74,6 +109,11 @@ private:
+    void SendLocalClip(void);
+    /* Forget the formats recorded in mLastClipboard*. */
+    void ClearLastClipboard(void);
++   /* Called when the requested host to guest file transfer has finished. */
++   void GetLocalFilesDone(bool success);
++   bool SetRemoteFileList(const CPClipboard *clip);
++   void RemoveHGBlock(void);
++   bool SetRemoteFileContents(const CPClipboard *clip);
+ 
+    /*
+     * Outcome of a guest -> host file list attempt. The caller has to be able
+@@ -88,6 +128,9 @@ private:
+ 
+    /* Turn the local uri-list selection into a file list for the host. */
+    FileListResult GetLocalFileList(gint64 deadline);
++   static void *FileBlockMonitorThread(void *arg);
++   static gboolean PasteObserved(gpointer data);
++   void TerminateThread(void);
+ 
+    GuestCopyPasteMgr *mCP;
+    CPClipboard mClipboard;
+@@ -121,7 +164,16 @@ private:
+    /* The generation last read again after its reads ran out of time. */
+    guint64 mRetriedGeneration;
+ 
++   /* State of a host to guest file paste. */
+    DnDBlockControl *mBlockCtrl;
++   bool mBlockAdded;
++   std::string mHGStagingDir;
++   /* Tells a paste report for the current block from a stale one. */
++   unsigned int mBlockGeneration;
++   WaylandThreadParams mThreadParams;
++   pthread_t mThread;
++   bool mThreadStarted;
++   bool mThreadInited;
+ };
+ 
+ #endif // __COPYPASTE_UI_WAYLAND_H__
+diff --git a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+index 9b6bad3..8a2d32a 100644
+--- a/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
++++ b/services/plugins/dndcp/dndGuestBase/copyPasteDnDWayland.h
+@@ -60,11 +60,14 @@ public:
+    virtual void SetDnDAllowed(bool allowed);
+    virtual uint32 GetCaps();
+ 
++   DnDBlockControl *GetBlockCtrl() { return &m_blockCtrl; }
++
+ private:
+    ToolsAppCtx *m_ctx;
+    CopyPasteUIWayland *m_copyPasteUI;
+    DnDUIX11 *m_dndUI;
+    DnDBlockControl m_blockCtrl;
++   bool m_blockInited;
+ #if defined(GTK3)
+    Gtk::Main *m_main;
+ #endif
+-- 
+2.55.0
+

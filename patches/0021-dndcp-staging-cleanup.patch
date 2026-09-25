@@ -1,0 +1,970 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:11 -0700
+Subject: [PATCH 21/21] dndcp: Remove staging directories once their transfers
+ are over
+
+A host to guest file transfer is staged under
+~/.cache/vmware/drag_and_drop, and nothing removed it afterwards. The
+delete-on-reboot call after a paste unlinks the directory's own path,
+which fails for a directory, so every transfer stayed on disk. The call
+stays, as the X11 backends have it, and its comment now says that it
+removes nothing on POSIX.
+
+Nothing tells the guest when a file manager has finished copying out of
+a staging directory, a paste can be repeated from the same clipboard
+later, and an application can open a dropped file by its staging path
+and save changes back to it. So a staging directory is removed only when
+all of these hold:
+
+- its name is one mkdtemp() made for it;
+- it is not empty, since an empty one is reused for the next transfer,
+  possibly a drag still in progress;
+- the clipboard does not offer it, in the Wayland or the X11 backend,
+  for a host file paste or for file contents, until another host or
+  guest copy replaces that clip;
+- no host to guest drag is still using it, until the host reports its
+  files done;
+- nothing in it has changed for two minutes;
+- no process holds a file in it open or has it as its working directory.
+
+The check runs when a new staging directory is made, when vmusr starts,
+and once a minute from the main loop, in the Wayland and the X11
+backend. A file manager copying out of the directory holds the file
+open, so the two minutes count from the end of the copy. It reads /proc
+once per run, and only when a directory is otherwise due. A tree with a
+read-only directory from the host is made writable first, so that it
+does not fail on every run.
+---
+ services/plugins/dndcp/copyPasteDnDUtil.cpp   |   6 +-
+ .../plugins/dndcp/copyPasteDnDWayland.cpp     |   7 +
+ services/plugins/dndcp/copyPasteDnDX11.cpp    |   7 +
+ services/plugins/dndcp/copyPasteUIWayland.cpp |  21 +
+ services/plugins/dndcp/copyPasteUIX11.cpp     |  19 +-
+ services/plugins/dndcp/copyPasteUIX11GTK4.cpp |  19 +-
+ services/plugins/dndcp/dnd/dnd.h              |   7 +
+ services/plugins/dndcp/dnd/dndXdg.c           | 611 +++++++++++++++++-
+ services/plugins/dndcp/dndUIX11GTK4.cpp       |   8 +
+ 9 files changed, 697 insertions(+), 8 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteDnDUtil.cpp b/services/plugins/dndcp/copyPasteDnDUtil.cpp
+index 1223c86..a206ab4 100644
+--- a/services/plugins/dndcp/copyPasteDnDUtil.cpp
++++ b/services/plugins/dndcp/copyPasteDnDUtil.cpp
+@@ -107,7 +107,8 @@ LocalIsSafeStagingName(const char *name,     // IN: host supplied file name
+  *      true if success, false otherwise.
+  *
+  * Side effects:
+- *      None.
++ *      On success, records the staging directory as the one whose files the
++ *      clipboard offers, so that the prune in dndXdg.c keeps it.
+  *
+  *----------------------------------------------------------------------------
+  */
+@@ -290,6 +291,9 @@ LocalPrepareFileContents(const CPClipboard *clip,                       // IN
+       }
+    }
+    g_debug("%s: created uri list\n", __FUNCTION__);
++#ifdef DND_IS_XDG
++   DnD_SetClipboardStagingDir(tempDir);
++#endif
+    ret = true;
+ 
+ exit:
+diff --git a/services/plugins/dndcp/copyPasteDnDWayland.cpp b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+index 2edc0ee..a51f3d3 100644
+--- a/services/plugins/dndcp/copyPasteDnDWayland.cpp
++++ b/services/plugins/dndcp/copyPasteDnDWayland.cpp
+@@ -76,6 +76,9 @@ CopyPasteDnDWayland::CopyPasteDnDWayland()
+ 
+ CopyPasteDnDWayland::~CopyPasteDnDWayland()
+ {
++#ifdef DND_IS_XDG
++   DnD_StopStagingPrune();
++#endif
+    if (m_copyPasteUI) {
+       delete m_copyPasteUI;
+       m_copyPasteUI = NULL;
+@@ -165,6 +168,10 @@ CopyPasteDnDWayland::Init(ToolsAppCtx *ctx)
+       g_debug("%s: vmblock %s (fd %d)\n", __FUNCTION__,
+               DnD_BlockIsReady(&m_blockCtrl) ? "ready" : "unavailable",
+               m_blockCtrl.fd);
++#ifdef DND_IS_XDG
++      /* Remove staging directories whose transfers are over; see dndXdg.c. */
++      DnD_StartStagingPrune();
++#endif
+    }
+ 
+    return TRUE;
+diff --git a/services/plugins/dndcp/copyPasteDnDX11.cpp b/services/plugins/dndcp/copyPasteDnDX11.cpp
+index 31bb391..aedc31e 100644
+--- a/services/plugins/dndcp/copyPasteDnDX11.cpp
++++ b/services/plugins/dndcp/copyPasteDnDX11.cpp
+@@ -249,6 +249,10 @@ CopyPasteDnDX11::Init(ToolsAppCtx *ctx)
+    if (wrapper) {
+       BlockService::GetInstance()->Init(ctx);
+    }
++#ifdef DND_IS_XDG
++   /* Remove staging directories whose transfers are over; see dndXdg.c. */
++   DnD_StartStagingPrune();
++#endif
+ #ifdef GTK4
+    gUserMainWidget = gtk_window_new();
+    gtk_widget_set_visible(gUserMainWidget, FALSE);
+@@ -280,6 +284,9 @@ CopyPasteDnDX11::Init(ToolsAppCtx *ctx)
+ 
+ CopyPasteDnDX11::~CopyPasteDnDX11()
+ {
++#ifdef DND_IS_XDG
++   DnD_StopStagingPrune();
++#endif
+    delete m_copyPasteUI;
+    delete m_dndUI;
+ #if defined(GTK3)
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+index 7077273..ad6e635 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.cpp
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp
+@@ -1319,6 +1319,14 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+       return;
+    }
+ 
++#ifdef DND_IS_XDG
++   /*
++    * The host clip replaces any file list the clipboard offered. A clip with
++    * files records its staging directory again below.
++    */
++   DnD_SetClipboardStagingDir(NULL);
++#endif
++
+    /*
+     * The host clipboard has changed, whether or not the clip can be
+     * installed here. Forget the earlier clips, so that a later guest copy
+@@ -2806,6 +2814,10 @@ CopyPasteUIWayland::SetRemoteFileList(const CPClipboard *clip)  // IN
+    }
+    mHGStagingDir = stagingDir;
+    free(stagingDir);
++#ifdef DND_IS_XDG
++   /* The clipboard offers these files from now on; keep them. */
++   DnD_SetClipboardStagingDir(mHGStagingDir.c_str());
++#endif
+ 
+    mBlockAdded = mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+    if (!mBlockAdded) {
+@@ -2981,6 +2993,9 @@ CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
+        * Ask for the staging dir to be deleted on next reboot, as the X11
+        * backends do. On POSIX, File_UnlinkDelayed() unlinks at once and
+        * fails on a directory, so this removes nothing.
++       * DnD_CreateStagingDirectory() and start-up remove the dir once the
++       * clipboard no longer offers it and its transfer is over; see
++       * dndXdg.c.
+        */
+       DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
+    } else {
+@@ -2996,6 +3011,9 @@ CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
+  *
+  *    Send the guest selection read into mClipboard to the host.
+  *
++ *    A new guest selection has replaced any host file list the clipboard
++ *    offered, so its staging directory no longer needs to outlive the prune.
++ *
+  * Results:
+  *    None.
+  *
+@@ -3008,6 +3026,9 @@ CopyPasteUIWayland::GetLocalFilesDone(bool success)  // IN
+ void
+ CopyPasteUIWayland::SendLocalClip(void)
+ {
++#ifdef DND_IS_XDG
++   DnD_SetClipboardStagingDir(NULL);
++#endif
+    mCP->DestUISendClip(&mClipboard);
+ }
+ 
+diff --git a/services/plugins/dndcp/copyPasteUIX11.cpp b/services/plugins/dndcp/copyPasteUIX11.cpp
+index 87aedf0..953afe7 100644
+--- a/services/plugins/dndcp/copyPasteUIX11.cpp
++++ b/services/plugins/dndcp/copyPasteUIX11.cpp
+@@ -420,6 +420,10 @@ CopyPasteUIX11::LocalGetFileRequestCB(Gtk::SelectionData& sd,        // IN:
+          sd.set(sd.get_target().c_str(), "");
+          return;
+       }
++#ifdef DND_IS_XDG
++      /* The clipboard hands out paths in here; keep it through a prune. */
++      DnD_SetClipboardStagingDir(hgStagingDir.c_str());
++#endif
+       mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
+ 
+       mBlockAdded = false;
+@@ -1204,6 +1208,14 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
+       return;
+    }
+ 
++#ifdef DND_IS_XDG
++   /*
++    * The host clip replaces any file list the clipboard offered. A clip with
++    * files records its staging directory again below.
++    */
++   DnD_SetClipboardStagingDir(NULL);
++#endif
++
+    if (mBlockAdded) {
+       mBlockAdded = false;
+       if (DnD_BlockIsReady(mBlockCtrl)) {
+@@ -1388,9 +1400,10 @@ CopyPasteUIX11::GetLocalFilesDone(bool success)
+    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+    if (success) {
+       /*
+-       * Mark current staging dir to be deleted on next reboot for FCP. The
+-       * file will not be deleted after reboot if it is moved to another
+-       * location by target application.
++       * Ask for the staging dir to be deleted on next reboot for FCP. On
++       * POSIX, File_UnlinkDelayed() unlinks at once and fails on a
++       * directory, so this removes nothing. DnD_CreateStagingDirectory()
++       * and start-up remove the dir once its transfer is over; see dndXdg.c.
+        */
+       DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
+    } else {
+diff --git a/services/plugins/dndcp/copyPasteUIX11GTK4.cpp b/services/plugins/dndcp/copyPasteUIX11GTK4.cpp
+index 0467429..b0327a2 100644
+--- a/services/plugins/dndcp/copyPasteUIX11GTK4.cpp
++++ b/services/plugins/dndcp/copyPasteUIX11GTK4.cpp
+@@ -346,9 +346,10 @@ CopyPasteUIX11::GetLocalFilesDone(bool success)
+    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+    if (success) {
+       /*
+-       * Mark current staging dir to be deleted on next reboot for FCP. The
+-       * file will not be deleted after reboot if it is moved to another
+-       * location by target application.
++       * Ask for the staging dir to be deleted on next reboot for FCP. On
++       * POSIX, File_UnlinkDelayed() unlinks at once and fails on a
++       * directory, so this removes nothing. DnD_CreateStagingDirectory()
++       * and start-up remove the dir once its transfer is over; see dndXdg.c.
+        */
+       DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
+    } else {
+@@ -1094,6 +1095,10 @@ CopyPasteUIX11::LocalGetFileRequest()
+ 	 mPrimClipboardPtr->unset_content();
+          return;
+       }
++#ifdef DND_IS_XDG
++      /* The clipboard hands out paths in here; keep it through a prune. */
++      DnD_SetClipboardStagingDir(hgStagingDir.c_str());
++#endif
+       mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
+ 
+       mBlockAdded = false;
+@@ -1409,6 +1414,14 @@ CopyPasteUIX11::GetRemoteClipboardCB(const CPClipboard *clip) // IN
+       return;
+    }
+ 
++#ifdef DND_IS_XDG
++   /*
++    * The host clip replaces any file list the clipboard offered. A clip with
++    * files records its staging directory again below.
++    */
++   DnD_SetClipboardStagingDir(NULL);
++#endif
++
+    if (mBlockAdded) {
+       mBlockAdded = false;
+       if (DnD_BlockIsReady(mBlockCtrl)) {
+diff --git a/services/plugins/dndcp/dnd/dnd.h b/services/plugins/dndcp/dnd/dnd.h
+index 82ec3fa..9f512fa 100644
+--- a/services/plugins/dndcp/dnd/dnd.h
++++ b/services/plugins/dndcp/dnd/dnd.h
+@@ -290,6 +290,13 @@ const char *DnD_GetFileRoot(void);
+ char *DnD_CreateStagingDirectory(void);
+ char *DnD_AppendPrefixToStagingDir(const char *oldName, const char *newName);
+ Bool DnD_DeleteStagingFiles(const char *stagingDir, Bool onReboot);
++#ifdef DND_IS_XDG
++void DnD_SetClipboardStagingDir(const char *stagingDir);
++void DnD_SetDragStagingDir(const char *stagingDir);
++void DnD_PruneStagingDirectories(void);
++void DnD_StartStagingPrune(void);
++void DnD_StopStagingPrune(void);
++#endif
+ Bool DnD_RemoveTempDirs(const char *dndTempDir, const char *prefix);
+ int DnD_LegacyConvertToCPName(const char *nameIn,
+                               size_t bufOutSize,
+diff --git a/services/plugins/dndcp/dnd/dndXdg.c b/services/plugins/dndcp/dnd/dndXdg.c
+index da54ee5..7cc95b5 100644
+--- a/services/plugins/dndcp/dnd/dndXdg.c
++++ b/services/plugins/dndcp/dnd/dndXdg.c
+@@ -26,8 +26,13 @@
+ 
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#include <dirent.h>
++#include <limits.h>
++#include <string.h>
++#include <time.h>
+ #include <pwd.h>
+ #include <stdlib.h>
++#include <glib.h>
+ 
+ #if defined __FreeBSD__
+ #include <unistd.h>
+@@ -51,6 +56,8 @@ static const char *CreateRealRootDirectory(void);
+ static const char *CreateApparentRootDirectory(void);
+ static char *FindSuitableExistingDirectory(const char *realRoot,
+                                            const char *apparentRoot);
++static void PruneStagingDirectories(const char *realRoot,
++                                    const char *apparentRoot);
+ static char *CreateStagingDirectory(const char *realRoot,
+                                     const char *apparentRoot);
+ 
+@@ -200,6 +207,8 @@ DnD_CreateStagingDirectory(void)
+       return NULL;
+    }
+ 
++   PruneStagingDirectories(realRoot, apparentRoot);
++
+ 
+    /*
+     * Search real root for empty directory.  If found, (re)use it.
+@@ -396,6 +405,605 @@ FindSuitableExistingDirectory(
+ }
+ 
+ 
++/*
++ * A staging directory is removed once nothing in it has changed for this
++ * long, no process holds a file in it open or has it as its working
++ * directory, and neither the clipboard nor a drag in progress uses it. See
++ * PruneStagingDirectories(). A file manager copying out of the directory
++ * holds the file open, and any change starts the wait again.
++ */
++#define DND_STAGING_PRUNE_AGE_SEC (2 * 60)
++
++/* Deeper trees are kept, rather than walked further. */
++#define DND_STAGING_PRUNE_MAX_DEPTH 32
++
++/* The mkdtemp() template for a staging directory name. */
++#define DND_STAGING_NAME_TEMPLATE "XXXXXX"
++#define DND_STAGING_NAME_LEN (sizeof DND_STAGING_NAME_TEMPLATE - 1)
++
++/* The staging directory behind the file list the clipboard offers. */
++static char *gClipboardStagingDir;
++
++/* The staging directory of a host to guest drag whose files are not done. */
++static char *gDragStagingDir;
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnD_SetClipboardStagingDir --
++ *
++ *      Record the staging directory whose files the clipboard now offers, so
++ *      that it outlives the prune for as long as it may still be pasted.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      Replaces the previously recorded directory.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++RecordStagingDir(char **slot,               // IN/OUT
++                 const char *stagingDir)    // IN/OPT
++{
++   size_t len;
++
++   free(*slot);
++   *slot = Util_SafeStrdup(stagingDir);
++   /* The prune compares without the trailing slash staging paths carry. */
++   len = *slot != NULL ? strlen(*slot) : 0;
++   while (len > 1 && (*slot)[len - 1] == '/') {
++      (*slot)[--len] = '\0';
++   }
++}
++
++
++void
++DnD_SetClipboardStagingDir(const char *stagingDir)   // IN/OPT
++{
++   RecordStagingDir(&gClipboardStagingDir, stagingDir);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnD_SetDragStagingDir --
++ *
++ *      Record the staging directory of a host to guest drag until its files
++ *      are done, so that the prune leaves it alone while the drag is still
++ *      over a target. NULL clears it.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      Replaces the previously recorded directory.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnD_SetDragStagingDir(const char *stagingDir)   // IN/OPT
++{
++   RecordStagingDir(&gDragStagingDir, stagingDir);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * IsInUseStagingDir --
++ *
++ *      Whether the clipboard or a drag in progress uses the staging directory
++ *      known by either of these two paths.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static Bool
++IsInUseStagingDir(const char *apparentDir,   // IN
++                  const char *realDir)       // IN
++{
++   const char *inUse[] = { gClipboardStagingDir, gDragStagingDir };
++   size_t i;
++
++   for (i = 0; i < ARRAYSIZE(inUse); i++) {
++      if (inUse[i] != NULL &&
++          (strcmp(inUse[i], apparentDir) == 0 ||
++           strcmp(inUse[i], realDir) == 0)) {
++         return TRUE;
++      }
++   }
++   return FALSE;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * ChangedSince --
++ *
++ *      Whether anything under `path` was modified or had its status changed
++ *      at or after `cutoff`, not following symlinks. A tree deeper than
++ *      DND_STAGING_PRUNE_MAX_DEPTH, or one that cannot be read, counts as
++ *      changed, so that it is kept.
++ *
++ * Results:
++ *      TRUE if something changed or the tree could not be read in full,
++ *      FALSE otherwise.
++ *
++ * Side effects:
++ *      None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static Bool
++ChangedSince(const char *path,   // IN
++             time_t cutoff,      // IN
++             int depth)          // IN
++{
++   struct stat sb;
++   DIR *dir;
++   struct dirent *de;
++   Bool changed = FALSE;
++
++   if (lstat(path, &sb) != 0) {
++      return TRUE;
++   }
++   if (sb.st_mtime >= cutoff || sb.st_ctime >= cutoff) {
++      return TRUE;
++   }
++   if (!S_ISDIR(sb.st_mode)) {
++      return FALSE;
++   }
++   if (depth >= DND_STAGING_PRUNE_MAX_DEPTH || (dir = opendir(path)) == NULL) {
++      return TRUE;
++   }
++   while (!changed && (de = readdir(dir)) != NULL) {
++      char *child;
++
++      if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
++         continue;
++      }
++      child = Str_Asprintf(NULL, "%s/%s", path, de->d_name);
++      changed = child == NULL || ChangedSince(child, cutoff, depth + 1);
++      free(child);
++   }
++   closedir(dir);
++
++   return changed;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * MakeTreeWritable --
++ *
++ *      Give the owner read, write and search permission on every directory
++ *      under `path` that this user owns, down to DND_STAGING_PRUNE_MAX_DEPTH.
++ *      The host's permissions can have taken them away, and the tree cannot
++ *      be deleted without them.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      Changes directory permissions under `path`.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++MakeTreeWritable(const char *path,   // IN
++                 int depth)          // IN
++{
++   struct stat sb;
++   DIR *dir;
++   struct dirent *de;
++
++   if (lstat(path, &sb) != 0 || !S_ISDIR(sb.st_mode) ||
++       sb.st_uid != getuid() || depth >= DND_STAGING_PRUNE_MAX_DEPTH) {
++      return;
++   }
++   if ((sb.st_mode & S_IRWXU) != S_IRWXU) {
++      chmod(path, (sb.st_mode & 07777) | S_IRWXU);
++   }
++   if ((dir = opendir(path)) == NULL) {
++      return;
++   }
++   while ((de = readdir(dir)) != NULL) {
++      char *child;
++
++      if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
++         continue;
++      }
++      child = Str_Asprintf(NULL, "%s/%s", path, de->d_name);
++      if (child != NULL) {
++         MakeTreeWritable(child, depth + 1);
++         free(child);
++      }
++   }
++   closedir(dir);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * AddLinkTarget --
++ *
++ *      Append the absolute target of the symlink `linkPath` to `paths`.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      May grow `paths`, which stays NULL-terminated.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++AddLinkTarget(const char *linkPath,   // IN
++              char ***paths,          // IN/OUT
++              int *count,             // IN/OUT
++              int *cap)               // IN/OUT
++{
++   char target[PATH_MAX];
++   ssize_t len = readlink(linkPath, target, sizeof target - 1);
++
++   if (len <= 0 || target[0] != '/') {
++      return;
++   }
++   target[len] = '\0';
++   if (*count + 1 >= *cap) {
++      *cap = *cap == 0 ? 256 : *cap * 2;
++      *paths = Util_SafeRealloc(*paths, *cap * sizeof **paths);
++   }
++   (*paths)[(*count)++] = Util_SafeStrdup(target);
++   (*paths)[*count] = NULL;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CollectOpenPaths --
++ *
++ *      The resolved paths of every open file and working directory of the
++ *      processes this user can inspect. The kernel reports each by its
++ *      resolved path, whether it was opened through the staging path, the
++ *      apparent root or vmblock.
++ *
++ * Results:
++ *      A NULL-terminated array to free with Util_FreeStringList(), and its
++ *      length in *count. NULL if /proc cannot be read, and then nothing
++ *      should be removed.
++ *
++ * Side effects:
++ *      None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static char **
++CollectOpenPaths(int *count)   // OUT
++{
++   DIR *proc = opendir("/proc");
++   struct dirent *pe;
++   char **paths = NULL;
++   int n = 0;
++   int cap = 0;
++
++   *count = 0;
++   if (proc == NULL) {
++      return NULL;
++   }
++   while ((pe = readdir(proc)) != NULL) {
++      char dirPath[64];
++      char linkPath[96];
++      DIR *fds;
++      struct dirent *fe;
++
++      if (pe->d_name[0] < '0' || pe->d_name[0] > '9') {
++         continue;
++      }
++      Str_Snprintf(linkPath, sizeof linkPath, "/proc/%s/cwd", pe->d_name);
++      AddLinkTarget(linkPath, &paths, &n, &cap);
++
++      Str_Snprintf(dirPath, sizeof dirPath, "/proc/%s/fd", pe->d_name);
++      if ((fds = opendir(dirPath)) == NULL) {
++         continue;
++      }
++      while ((fe = readdir(fds)) != NULL) {
++         if (fe->d_name[0] == '.') {
++            continue;
++         }
++         Str_Snprintf(linkPath, sizeof linkPath, "%s/%s", dirPath, fe->d_name);
++         AddLinkTarget(linkPath, &paths, &n, &cap);
++      }
++      closedir(fds);
++   }
++   closedir(proc);
++   if (paths == NULL) {
++      paths = Util_SafeCalloc(1, sizeof *paths);
++   }
++   *count = n;
++
++   return paths;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * PathIsUnder --
++ *
++ *      Whether `path` is `dir` or lies within it.
++ *
++ * Results:
++ *      TRUE if it is, FALSE otherwise.
++ *
++ * Side effects:
++ *      None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static Bool
++PathIsUnder(const char *path,   // IN
++            const char *dir)    // IN
++{
++   size_t len = strlen(dir);
++
++   return strncmp(path, dir, len) == 0 &&
++          (path[len] == '\0' || path[len] == '/');
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * IsStagingName --
++ *
++ *      Whether `name` is one mkdtemp() could have made for
++ *      CreateStagingDirectory(), DND_STAGING_NAME_LEN characters from
++ *      [A-Za-z0-9].
++ *
++ * Results:
++ *      TRUE if it is, FALSE otherwise.
++ *
++ * Side effects:
++ *      None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static Bool
++IsStagingName(const char *name)   // IN
++{
++   size_t i;
++
++   for (i = 0; i < DND_STAGING_NAME_LEN; i++) {
++      char c = name[i];
++
++      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++            (c >= '0' && c <= '9'))) {
++         return FALSE;
++      }
++   }
++   return name[DND_STAGING_NAME_LEN] == '\0';
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * PruneStagingDirectories --
++ *
++ *      Remove staging directories whose transfers are over.
++ *
++ *      Nothing tells the guest when a file manager has finished copying out
++ *      of a staging directory, and a paste can be repeated from the same
++ *      clipboard long after the first. So a directory goes only when its name
++ *      is one this file creates, it is not empty (an empty one is reused by
++ *      FindSuitableExistingDirectory(), possibly for a drag still in
++ *      progress), neither the clipboard nor a drag in progress uses it (see
++ *      DnD_SetClipboardStagingDir() and DnD_SetDragStagingDir()), nothing in
++ *      it has changed for DND_STAGING_PRUNE_AGE_SEC, and no process holds a
++ *      file in it open or has it as its working directory. The symlink in the apparent root
++ *      that points at it goes with it.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      Deletes directories under realRoot and symlinks under apparentRoot.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static void
++PruneStagingDirectories(const char *realRoot,       // IN
++                        const char *apparentRoot)   // IN
++{
++   char **names = NULL;
++   int count = File_ListDirectory(realRoot, &names);
++   time_t cutoff = time(NULL) - DND_STAGING_PRUNE_AGE_SEC;
++   char **openPaths = NULL;
++   int openCount = 0;
++   Bool collected = FALSE;
++   int i;
++
++   for (i = 0; i < count; i++) {
++      char *realDir = Unicode_Append(realRoot, names[i]);
++      char *apparentDir = Unicode_Append(apparentRoot, names[i]);
++      char *resolvedDir = NULL;
++      char *link = NULL;
++      Bool open = FALSE;
++      struct stat sb;
++      int j;
++
++      if (!IsStagingName(names[i]) ||
++          lstat(realDir, &sb) != 0 || !S_ISDIR(sb.st_mode) ||
++          sb.st_uid != getuid() || File_IsEmptyDirectory(realDir)) {
++         goto next;
++      }
++      if (IsInUseStagingDir(apparentDir, realDir)) {
++         goto next;
++      }
++      if (ChangedSince(realDir, cutoff, 0)) {
++         goto next;
++      }
++
++      /* Only now, for a directory that is otherwise due, look at /proc. */
++      if (!collected) {
++         openPaths = CollectOpenPaths(&openCount);
++         collected = TRUE;
++      }
++      if (openPaths == NULL) {
++         goto next;
++      }
++      resolvedDir = realpath(realDir, NULL);
++      for (j = 0; j < openCount && !open; j++) {
++         open = PathIsUnder(openPaths[j], realDir) ||
++                (resolvedDir != NULL && PathIsUnder(openPaths[j], resolvedDir));
++      }
++      if (open) {
++         goto next;
++      }
++
++      MakeTreeWritable(realDir, 0);
++      if (!File_DeleteDirectoryTree(realDir)) {
++         Log("%s: could not remove %s\n", __FUNCTION__, realDir);
++         goto next;
++      }
++      if (Posix_Lstat(apparentDir, &sb) == 0 && S_ISLNK(sb.st_mode) &&
++          sb.st_uid == getuid() &&
++          (link = Posix_ReadLink(apparentDir)) != NULL &&
++          strcmp(link, realDir) == 0) {
++         Posix_Unlink(apparentDir);
++      }
++      Log("%s: removed %s\n", __FUNCTION__, realDir);
++
++next:
++      free(link);
++      free(resolvedDir);
++      free(realDir);
++      free(apparentDir);
++   }
++   Util_FreeStringList(names, count);
++   if (openPaths != NULL) {
++      Util_FreeStringList(openPaths, openCount);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnD_PruneStagingDirectories --
++ *
++ *      PruneStagingDirectories() on the user's staging roots, for a caller
++ *      that is not about to create a staging directory, such as start-up.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      See PruneStagingDirectories().
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnD_PruneStagingDirectories(void)
++{
++   const char *realRoot = DetermineRealRootDirectory();
++   const char *apparentRoot = DnD_GetFileRoot();
++
++   if (realRoot != NULL && apparentRoot != NULL &&
++       File_IsDirectory(realRoot) && File_IsDirectory(apparentRoot)) {
++      PruneStagingDirectories(realRoot, apparentRoot);
++   }
++}
++
++
++/* How often DnD_StartStagingPrune() checks again. */
++#define DND_STAGING_PRUNE_INTERVAL_SEC 60
++
++static guint gPruneTimer;
++
++
++static gboolean
++OnStagingPruneTimer(gpointer data)   // IN: unused
++{
++   DnD_PruneStagingDirectories();
++   return G_SOURCE_CONTINUE;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnD_StartStagingPrune --
++ *
++ *      Prune the staging directories now, and again every
++ *      DND_STAGING_PRUNE_INTERVAL_SEC from the main loop, so that a transfer
++ *      that is over goes without waiting for the next one to start.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      Adds a timer to the default main context.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnD_StartStagingPrune(void)
++{
++   DnD_PruneStagingDirectories();
++   if (gPruneTimer == 0) {
++      gPruneTimer = g_timeout_add_seconds(DND_STAGING_PRUNE_INTERVAL_SEC,
++                                          OnStagingPruneTimer, NULL);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnD_StopStagingPrune --
++ *
++ *      Remove the timer DnD_StartStagingPrune() added.
++ *
++ * Results:
++ *      None.
++ *
++ * Side effects:
++ *      None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnD_StopStagingPrune(void)
++{
++   if (gPruneTimer != 0) {
++      g_source_remove(gPruneTimer);
++      gPruneTimer = 0;
++   }
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -425,7 +1033,8 @@ CreateStagingDirectory(
+    for (i = 0; i < 10 && result == NULL; i++) {
+       char *apparentStagingDir = NULL;
+       // Reminder: mkdtemp updates its arg in-place.
+-      char *realStagingDir = Str_SafeAsprintf(NULL, "%sXXXXXX", realRoot);
++      char *realStagingDir =
++         Str_SafeAsprintf(NULL, "%s" DND_STAGING_NAME_TEMPLATE, realRoot);
+ 
+       if (mkdtemp(realStagingDir) != NULL) {
+          char *randomPart = strrchr(realStagingDir, '/') + 1;
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index a61ba66..4f8af71 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -1385,6 +1385,10 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+ 
+    if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILELIST, &buf, &sz)) {
+       mHGStagingDir = utf::string(stagingDir.c_str());
++#ifdef DND_IS_XDG
++      /* Until OnGetFilesDone(), the prune must leave the directory alone. */
++      DnD_SetDragStagingDir(mHGStagingDir.c_str());
++#endif
+ 
+       /* Provide path within vmblock file system instead of actual path. */
+       stagingDirName = GetLastDirName(mHGStagingDir);
+@@ -2268,6 +2272,10 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
+     */
+ 
+    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
++#ifdef DND_IS_XDG
++   /* The files are written. Open files and the age rule protect them now. */
++   DnD_SetDragStagingDir(NULL);
++#endif
+ 
+    /*
+     * The host decides when this arrives, and the RPC layer does not check
+-- 
+2.55.0
+

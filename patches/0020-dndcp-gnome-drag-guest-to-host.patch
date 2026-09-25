@@ -1,0 +1,633 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:11 -0700
+Subject: [PATCH 20/21] dndcp: Make guest to host drags reach the drop target
+ on GNOME and sway
+
+A guest to host drag failed on GNOME too. The detection window was
+mapped below the focused window, so a drag leaving a maximized window
+never reached it. Under Mutter the window is now raised above other
+windows when it is shown as a drop target, and the check for Mutter from
+the previous patch now also runs then. Under any Wayland compositor the
+pointer is moved over the window three more times from the main loop.
+Mutter did not offer the drag to the window on the first move, but did
+on the same move made moments later.
+
+A tiling compositor such as sway floats the window where it chooses,
+often in the middle of the output rather than at the edge the pointer
+left by, so no drag ever passed over it. Once the window is managed, the
+plugin reads where it is and moves the pointer there.
+
+After a guest to host drop, the host keeps the guest mouse's button down
+until the pointer next moves over the guest. Mutter ends a drag only
+once no device holds the button, and the kernel drops a release from a
+uinput device whose button is already up, so the release faked through
+uinput did nothing. The guest's drag stayed alive and dropped wherever
+the pointer was when the host let go. If the drag is still offered to
+the detection window 300 ms after the drop, and has not dropped on it,
+the plugin now cancels it with Escape, which the uinput device can now
+send. The detection window watches for XdndEnter and XdndDrop itself,
+because GTK keeps a drop that has arrived until it has read the value,
+and the drop alone cannot tell a running drag from one that has just
+dropped. The check runs only under Mutter.
+
+A guest to host drag out of a maximized Nautilus 50.2.2 on GNOME 50.3
+(Bluefin 44) was tested by hand. Guest drags of files and text, and the
+Escape after a guest to host drop, were then tested by hand with the
+final code.
+---
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |   3 +
+ .../dndcp/dndGuestBase/dragDetWndX11GTK4.h    |  22 +-
+ services/plugins/dndcp/dndUIX11GTK4.cpp       |  80 ++++++-
+ services/plugins/dndcp/dragDetWndX11GTK4.cpp  | 199 +++++++++++++++++-
+ .../fakeMouseWayland/fakeMouseWayland.cpp     |  58 +++++
+ .../dndcp/fakeMouseWayland/fakeMouseWayland.h |   1 +
+ 6 files changed, 357 insertions(+), 6 deletions(-)
+
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index c60570f..18f7756 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -90,6 +90,7 @@ private:
+    void LocalXdndRestoreDetWnd(void);
+    bool LocalXdndIsStaleDrag(GdkDrag *drag);
+    static gboolean OnXdndReleaseTick(gpointer ctx);
++   static gboolean OnGHDropCheck(gpointer ctx);
+    bool StageFilePlaceholders(const DnDFileList &fList);
+    void ClearFilePlaceholders(void);
+    void AddBlockForDrop(void);
+@@ -275,6 +276,8 @@ private:
+    gint64 mHGXdndLeftAt;
+    gint64 mHGXdndDropAt;
+    int mHGXdndReleaseTicks;
++   /* See OnGHDropCheck(). */
++   guint mGHDropCheckTimer;
+    /* See LocalXdndChoosePath(). */
+    bool mMutterBridgesXdnd;
+    /* A native Wayland drag is running, so the XDND teardown must not run. */
+diff --git a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+index 4534bab..d33b752 100644
+--- a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+@@ -70,7 +70,8 @@ public:
+    bool register_target_value_handler(target_drag_value_handler handler, void *ctx);
+    bool EnableDND(void);
+    bool DisableDND(void);
+-   void UpdateDetWnd(bool Show, int32 x, int32 y, bool asDropTarget = false);
++   void UpdateDetWnd(bool Show, int32 x, int32 y, bool asDropTarget = false,
++                     bool above = false);
+    bool SimulateXEvents(const bool showWidget, const bool buttonEvent,
+                         const bool buttonPress, const bool moveWindow,
+                         const bool coordsProvided,
+@@ -91,6 +92,12 @@ public:
+     * over the detection window.
+     */
+    bool PointerIsOver(int x, int y);
++   /*
++    * Whether the drag that last entered the window has dropped on it. GTK
++    * keeps the drop until it has read the value, so Get_Current_Drop_ctx()
++    * alone cannot tell a running drag from one that has just dropped.
++    */
++   bool XdndDropped(void) { return mXdndDropped; }
+    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
+                   int mouseX,
+                   int mouseY);
+@@ -108,9 +115,13 @@ private:
+    void Raise();
+    void ApplyDetWndMode();
+    bool WaitUntilManaged(unsigned int timeoutMs);
++   static gboolean OnDropTargetNudge(gpointer data);
++   void CancelDropTargetNudges(void);
+    void RequestSkipTaskbar();
+    bool GetXWindow(Display **display, Window *xwindow);
+    void SendWmState(long action, Atom first, Atom second, long source);
++   static gboolean OnXEvent(GdkX11Display *display, const XEvent *xevent,
++                            gpointer data);
+    void Lower();
+    void Flush();
+    int GetScreenWidth();
+@@ -130,12 +141,21 @@ private:
+    bool mUnderWayland;
+    bool mWarpXPointer;
+    bool mAbove;
++   guint mNudgeTimer;
++   int mNudgeX;
++   int mNudgeY;
++   int mNudgesLeft;
+    /* Where SetGeometry() last asked for the window, for the WM_NORMAL_HINTS. */
+    bool mPlaced;
+    int mPlacedX;
+    int mPlacedY;
+    int mScreenWidth;
+    int mScreenHeight;
++   /* The "xevent" handler that sets mXdndDropped, and its atoms. */
++   gulong mXEventHandler;
++   Atom mXdndEnter;
++   Atom mXdndDrop;
++   bool mXdndDropped;
+ };
+ 
+ #endif // DRAG_DET_WND_H
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index f08ea94..a61ba66 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -128,6 +128,8 @@ extern "C" {
+  * for the window under the pointer within a few milliseconds of a motion.
+  */
+ #define XDND_DROP_SETTLE_MS 100
++/* How long after a guest to host drop OnGHDropCheck() looks at the drag. */
++#define GH_DROP_CHECK_MS 300
+ 
+ 
+ /*
+@@ -167,6 +169,7 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
+       mHGXdndLeftAt(0),
+       mHGXdndDropAt(0),
+       mHGXdndReleaseTicks(0),
++      mGHDropCheckTimer(0),
+       mMutterBridgesXdnd(false),
+       mWaylandDragActive(false),
+       mWaylandDragGen(0),
+@@ -216,6 +219,10 @@ DnDUIX11::~DnDUIX11()
+ {
+    TRACE_CALL();
+ 
++   if (mGHDropCheckTimer != 0) {
++      g_source_remove(mGHDropCheckTimer);
++      mGHDropCheckTimer = 0;
++   }
+    if (mDetWnd) {
+       delete mDetWnd;
+       mDetWnd = NULL;
+@@ -1955,12 +1962,78 @@ DnDUIX11::OnDestCancel()
+        */
+       mDetWnd->SimulateXEvents(true, true, false, true, false,
+                                mOriginX, mOriginY);
++#ifdef USE_UINPUT
++      /*
++       * See OnGHDropCheck(). Only GNOME has been seen to keep the guest's
++       * drag alive after the drop, so the check runs only under Mutter.
++       */
++      if (FakeMouse_IsInit() && LocalMutterBridgesXdnd()) {
++         if (mGHDropCheckTimer != 0) {
++            g_source_remove(mGHDropCheckTimer);
++         }
++         mGHDropCheckTimer = g_timeout_add(GH_DROP_CHECK_MS, OnGHDropCheck,
++                                           this);
++      }
++#endif
+    }
+    mDestDropTime = GetTimeInMillis();
+    ResetUI();
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::OnGHDropCheck --
++ *
++ *      Cancel the guest's drag if the release in OnDestCancel() did not end
++ *      it.
++ *
++ *      The drag started with the mouse the host drives, and the uinput
++ *      device never pressed. The kernel drops a release from a device that
++ *      never pressed, so the release faked through uinput reaches no
++ *      compositor. On GNOME the host also keeps its mouse's button down after
++ *      the user drops on the host, until the pointer next moves over the
++ *      guest. Left alone, the drag drops wherever the pointer is when the
++ *      host lets go. Escape cancels it. While the host holds the button,
++ *      Mutter still keeps the pointer on the window the drag started in, so
++ *      a host to guest drag cannot start until then either way.
++ *
++ *      A drag that has ended has either dropped on the detection window or
++ *      left it. After a drop GTK keeps the drop while it reads the value, so
++ *      the drop is checked for as well. A drag that still offers a drop to
++ *      the window, and has not dropped, is still running, and Escape then
++ *      goes to the drag rather than to an application.
++ *
++ * Results:
++ *      G_SOURCE_REMOVE.
++ *
++ * Side effects:
++ *      May press Escape.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++DnDUIX11::OnGHDropCheck(gpointer ctx)   // IN: the DnDUIX11
++{
++   DnDUIX11 *ui = static_cast<DnDUIX11 *>(ctx);
++
++   ui->mGHDropCheckTimer = 0;
++#ifdef USE_UINPUT
++   /* A host to guest drag may have started since, over its own window. */
++   if (ui->mDetWnd != NULL && !ui->mInHGDrag && !ui->mHGButtonDown &&
++       ui->mDetWnd->Get_Current_Drop_ctx() != 0 &&
++       !ui->mDetWnd->XdndDropped()) {
++      g_debug("%s: the guest drag outlived the drop; cancelling it\n",
++              __FUNCTION__);
++      FakeMouse_Escape();
++   }
++#endif
++   return G_SOURCE_REMOVE;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -2253,6 +2326,10 @@ DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
+    /* If the window is being shown, move it to the right place. */
+    if (show) {
+       UpdateWorkArea();
++      /* A guest to host drag starts with the window shown as a drop target. */
++      if (role == DET_WND_DROP_TARGET) {
++         LocalXdndChoosePath();
++      }
+       x = MAX(x - DRAG_DET_WINDOW_WIDTH / 2, mOriginX);
+       y = MAX(y - DRAG_DET_WINDOW_WIDTH / 2, mOriginY);
+       /*
+@@ -2261,7 +2338,8 @@ DnDUIX11::ShowDetWnd(bool show,      // IN: show (true) or hide (false)
+        * manager. The caller passes the role because mInHGDrag is not set yet
+        * when that drag begins.
+        */
+-      mDetWnd->UpdateDetWnd(show, x, y, role != DET_WND_DRAG_SOURCE);
++      mDetWnd->UpdateDetWnd(show, x, y, role != DET_WND_DRAG_SOURCE,
++                            role == DET_WND_DROP_TARGET && LocalMutterBridgesXdnd());
+    } else {
+       g_debug("%s: hide\n", __FUNCTION__);
+       mDetWnd->UpdateDetWnd(show, x, y);
+diff --git a/services/plugins/dndcp/dragDetWndX11GTK4.cpp b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+index 9a06952..19dd073 100644
+--- a/services/plugins/dndcp/dragDetWndX11GTK4.cpp
++++ b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+@@ -39,6 +39,10 @@ extern "C" {
+ #include <string.h>
+ }
+ 
++/* See DragDetWnd::OnDropTargetNudge(). */
++#define DROP_TARGET_NUDGES    3
++#define DROP_TARGET_NUDGE_MS  100
++
+ /* How long UpdateDetWnd() waits for the window manager to adopt the window. */
+ #define DET_WND_MANAGE_TIMEOUT_MS 500
+ 
+@@ -89,12 +93,21 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
+      mUnderWayland(DetWndUnderWayland()),
+      mWarpXPointer(true),
+      mAbove(false),
++     mNudgeTimer(0),
++     mNudgeX(0),
++     mNudgeY(0),
++     mNudgesLeft(0),
+      mPlaced(false),
+      mPlacedX(0),
+      mPlacedY(0),
+      mScreenWidth(0),
+-     mScreenHeight(0)
++     mScreenHeight(0),
++     mXEventHandler(0),
++     mXdndEnter(None),
++     mXdndDrop(None),
++     mXdndDropped(false)
+ {
++   GdkDisplay *gdkDisplay = gdk_display_get_default();
+    std::vector<GType> types;
+    mWnd = new Gtk::Window();
+    if (!mWnd) {
+@@ -163,6 +176,12 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
+     */
+    mTarget->set_preload(false);
+ 
++   /* See OnXEvent(). */
++   if (gdkDisplay != NULL && GDK_IS_X11_DISPLAY(gdkDisplay)) {
++      mXEventHandler = g_signal_connect(gdkDisplay, "xevent",
++                                        G_CALLBACK(OnXEvent), this);
++   }
++
+ /* Need to check USE_UINPUT, as FreeBSD does not support this */
+ #ifdef USE_UINPUT
+    // Uinput simulation for wayland backend.
+@@ -207,6 +226,13 @@ fail:
+ 
+ DragDetWnd::~DragDetWnd()
+ {
++   GdkDisplay *gdkDisplay = gdk_display_get_default();
++
++   if (mXEventHandler != 0 && gdkDisplay != NULL) {
++      g_signal_handler_disconnect(gdkDisplay, mXEventHandler);
++      mXEventHandler = 0;
++   }
++   CancelDropTargetNudges();
+ #ifdef USE_UINPUT
+    if (mUseUInput) {
+       FakeMouse_Destory();
+@@ -835,7 +861,8 @@ DetWndIsManaged(Display *display,  // IN
+  *    the pointer moves. In a guest to host drag the first motion is the move
+  *    that UpdateDetWnd() makes through SimulateXEvents() after this returns,
+  *    and on KWin a move before the window is ready loses the drag for its
+- *    whole duration.
++ *    whole duration. OnDropTargetNudge() repeats the move from the main
++ *    loop.
+  *
+  * Results:
+  *    True if the window is managed, false if timeoutMs passed first.
+@@ -1488,12 +1515,16 @@ DragDetWnd::GetGeometry(int &x, int &y, int &width, int &height)
+  */
+ 
+ void
+-DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
++DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget,
++                         bool above)
+ {
+   g_debug("%s: enter 0x%lx show %d x %d y %d\n",
+          __FUNCTION__,
+          (unsigned long) Get_Current_Drop_ctx(), show, x, y);
+ 
++   /* A show in any role, or a hide, ends the moves of an earlier show. */
++   CancelDropTargetNudges();
++
+    /* If the window is being shown, move it to the right place. */
+    if (show) {
+       /* Before the map as well, so that the map itself uses the position. */
+@@ -1516,9 +1547,38 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
+        * the drag source, and the delay there loses the drop target, so the
+        * drag ends in GDK_DRAG_CANCEL_NO_TARGET.
+        */
++      int moveX = x + 2;
++      int moveY = y + 2;
++
+       if (asDropTarget && mUnderWayland) {
++         int gx, gy, gw, gh;
+ 
+          WaitUntilManaged(DET_WND_MANAGE_TIMEOUT_MS);
++         /*
++          * Mutter maps a window that does not take focus below the focused
++          * window. A drag leaving the guest usually starts in the focused
++          * window, so that window would get the drag instead. The caller
++          * asks for this only under Mutter. See OnDropTargetNudge() for the
++          * rest.
++          */
++         if (above) {
++            SetAbove(true);
++         }
++         /*
++          * A tiling compositor such as sway floats the window where it
++          * chooses, in the middle of the output, not at the edge the pointer
++          * left by. Move the pointer to where the window is.
++          */
++         GetGeometry(gx, gy, gw, gh);
++         if (ABS(gx - x) > 2 || ABS(gy - y) > 2) {
++            if (gw <= 1 || gh <= 1) {
++               gw = gh = DRAG_DET_WINDOW_WIDTH * 2;
++            }
++            moveX = gx + gw / 2;
++            moveY = gy + gh / 2;
++            g_debug("%s: the window is at (%d, %d), not where asked\n",
++                    __FUNCTION__, gx, gy);
++         }
+       }
+       g_debug("%s: show at (%d, %d, %d, %d)\n", __FUNCTION__, x, y, DRAG_DET_WINDOW_WIDTH * 2, DRAG_DET_WINDOW_WIDTH * 2);
+       /*
+@@ -1533,9 +1593,16 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
+        * the target does not get re-entered before the release arrives.
+        */
+       if (asDropTarget) {
+-         SimulateMouseMove(x + 2, y + 2);
++         SimulateMouseMove(moveX, moveY);
+       }
+       SetIsVisible(true);
++      if (asDropTarget && mUnderWayland) {
++         mNudgeX = moveX;
++         mNudgeY = moveY;
++         mNudgesLeft = DROP_TARGET_NUDGES;
++         mNudgeTimer = g_timeout_add(DROP_TARGET_NUDGE_MS, OnDropTargetNudge,
++                                     this);
++      }
+    } else {
+       g_debug("%s: hide\n", __FUNCTION__);
+       Hide();
+@@ -1544,6 +1611,130 @@ DragDetWnd::UpdateDetWnd(bool show, int32 x, int32 y, bool asDropTarget)
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::OnDropTargetNudge --
++ *
++ *    Move the mouse over the drop target again, from the main loop, a few
++ *    times after UpdateDetWnd() shows it under Wayland.
++ *
++ *    The compositor offers a drag to the window under the pointer only when
++ *    the pointer moves. Mutter, for one, does not offer it to the window on
++ *    the move in UpdateDetWnd(), even after raising it, but does on the
++ *    same move made from the main loop moments later. GTK draws the window's first
++ *    frame from the main loop, which UpdateDetWnd() blocks until after its
++ *    move, and that is the likely difference. The pointer is already on the
++ *    window, so the extra moves do nothing else.
++ *
++ * Results:
++ *    G_SOURCE_CONTINUE while nudges are left, else G_SOURCE_REMOVE.
++ *
++ * Side effects:
++ *    Moves the mouse.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++DragDetWnd::OnDropTargetNudge(gpointer data)  // IN: the DragDetWnd
++{
++   DragDetWnd *self = static_cast<DragDetWnd *>(data);
++
++   if (!self->GetIsVisible() || self->mNudgesLeft <= 0) {
++      self->mNudgeTimer = 0;
++      return G_SOURCE_REMOVE;
++   }
++   self->mNudgesLeft--;
++   self->SimulateMouseMove(self->mNudgeX, self->mNudgeY);
++   if (self->mNudgesLeft > 0) {
++      return G_SOURCE_CONTINUE;
++   }
++   self->mNudgeTimer = 0;
++   return G_SOURCE_REMOVE;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::CancelDropTargetNudges --
++ *
++ *    Stop the moves that UpdateDetWnd() scheduled through
++ *    OnDropTargetNudge().
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    Removes the nudge timer.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DragDetWnd::CancelDropTargetNudges(void)
++{
++   if (mNudgeTimer != 0) {
++      g_source_remove(mNudgeTimer);
++      mNudgeTimer = 0;
++   }
++   mNudgesLeft = 0;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::OnXEvent --
++ *
++ *    Note when a drag enters the detection window and when it drops on it.
++ *
++ *    GTK keeps the drop after XdndDrop until it has read the value, and
++ *    reports no drop until then. DnDUIX11::OnGHDropCheck() must not take a
++ *    drag that has dropped for one that is still running.
++ *
++ * Results:
++ *    FALSE, so that GDK handles the event as usual.
++ *
++ * Side effects:
++ *    Sets mXdndDropped.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++gboolean
++DragDetWnd::OnXEvent(GdkX11Display *display,   // IN: unused
++                     const XEvent *xevent,     // IN
++                     gpointer data)            // IN: the DragDetWnd
++{
++   DragDetWnd *self = static_cast<DragDetWnd *>(data);
++   Display *xdisplay;
++   Window xwindow;
++
++   if (xevent->type != ClientMessage) {
++      return FALSE;
++   }
++   /* Only the first client message asks the server for the atoms. */
++   if (self->mXdndEnter == None) {
++      self->mXdndEnter = XInternAtom(xevent->xany.display, "XdndEnter", False);
++      self->mXdndDrop = XInternAtom(xevent->xany.display, "XdndDrop", False);
++   }
++   if ((xevent->xclient.message_type != self->mXdndEnter &&
++        xevent->xclient.message_type != self->mXdndDrop) ||
++       !self->GetXWindow(&xdisplay, &xwindow) ||
++       xevent->xclient.window != xwindow) {
++      return FALSE;
++   }
++   self->mXdndDropped = xevent->xclient.message_type == self->mXdndDrop;
++   if (self->mXdndDropped) {
++      g_debug("%s: XdndDrop on the detection window\n", __FUNCTION__);
++   }
++
++   return FALSE;
++}
++
++
+ /**
+  *  Start drag from drag source with current coordinate.
+  */
+diff --git a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
+index a029524..ca1dd74 100644
+--- a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
++++ b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
+@@ -147,6 +147,10 @@ FakeMouse_Init(int fd,       // fd for uinput
+       g_debug("%s: Failed to register UI_SET_KEYBIT BTN_LEFT\n", __FUNCTION__);
+       goto exit;
+    }
++   /* For FakeMouse_Escape(). The pointer works without it. */
++   if (ioctl(uinput_fd, UI_SET_KEYBIT, KEY_ESC) < 0) {
++      g_debug("%s: Failed to register UI_SET_KEYBIT KEY_ESC\n", __FUNCTION__);
++   }
+ 
+    /*
+     * Without an INPUT_PROP_* bit, udev and libinput cannot tell what kind of
+@@ -371,6 +375,60 @@ FakeMouse_Button(bool down)  // IN
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * FakeMouse_Escape --
++ *
++ *      Press and release Escape, which cancels a drag in progress.
++ *
++ *      A compositor ends a drag when the button is released, but it counts
++ *      the button as down while any device holds it. Once a drag started with
++ *      another mouse, a release from this device changes nothing, and Escape
++ *      is the only way left to end the drag.
++ *
++ * Results:
++ *      True if success.
++ *
++ * Side effects:
++ *      Keyboard events.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++FakeMouse_Escape(void)
++{
++   if (!FakeMouse_IsInit()) {
++      return false;
++   }
++
++   bool retValue = true;
++   struct input_event event;
++
++   for (int down = 1; down >= 0; down--) {
++      memset(&event, 0, sizeof event);
++      gettimeofday(&event.time, NULL);
++      event.type = EV_KEY;
++      event.code = KEY_ESC;
++      event.value = down;
++      if (write(uinput_fd, &event, sizeof(event)) < 0) {
++         retValue = false;
++      }
++      event.type = EV_SYN;
++      event.code = SYN_REPORT;
++      event.value = 0;
++      if (write(uinput_fd, &event, sizeof(event)) < 0) {
++         retValue = false;
++      }
++   }
++   if (!retValue) {
++      g_debug("%s: Failed to write\n", __FUNCTION__);
++   }
++   return retValue;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+diff --git a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h
+index d6c13be..e42e01a 100644
+--- a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h
++++ b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.h
+@@ -33,5 +33,6 @@ void FakeMouse_Destory();
+ bool FakeMouse_Move(int x, int y);
+ bool FakeMouse_Button(bool down);
+ bool FakeMouse_Click(bool down);
++bool FakeMouse_Escape(void);
+ 
+ #endif // __FAKE_MOUSE_WAYLAND_H__
+-- 
+2.55.0
+

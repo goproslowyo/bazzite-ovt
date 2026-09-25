@@ -1,0 +1,658 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:10 -0700
+Subject: [PATCH 08/21] dndcp: Send the guest clipboard to the host in a
+ Wayland session
+
+Answer the host's requests for the guest clipboard. The backend reads an
+image first, then RTF with its plain text rendering, then plain text, as
+copyPasteUIX11.cpp does. Every request gets exactly one reply, with an
+empty or not-changed clip when there is nothing new.
+
+The host asks for the guest clipboard every few seconds while the
+pointer crosses the VM's edge. The backend reads the selection only
+after it has changed, going by the count of selection events that
+waylandClipboard/ keeps. A selection that this process owns is not read
+back. A changed selection can still hold what was sent last, when the
+same text is copied again or a clipboard manager takes over the
+selection, so the content is compared too.
+
+Reads stop at a deadline instead of blocking. The main loop also carries
+the RPC channel, and an owner that stops writing must not stall it. All
+the reads for one host request share a 2 s budget. A read that runs out
+of time is tried once more on the next request, and after that only when
+the selection changes again.
+
+The cache of what was last sent is updated only once the item is on the
+outgoing clip, and a new host clip clears it. Updating it earlier would
+make a failed send look unchanged on the next attempt, and that content
+could then never be copied again. The backend reads the guest selection
+once at start-up, so that an old guest clip does not look new and
+overwrite a newer host clipboard as soon as the VM gets focus.
+---
+ services/plugins/dndcp/copyPasteUIWayland.cpp | 499 +++++++++++++++++-
+ services/plugins/dndcp/copyPasteUIWayland.h   |  18 +-
+ 2 files changed, 511 insertions(+), 6 deletions(-)
+
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.cpp b/services/plugins/dndcp/copyPasteUIWayland.cpp
+index d157a29..29e96f5 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.cpp
++++ b/services/plugins/dndcp/copyPasteUIWayland.cpp
+@@ -21,7 +21,7 @@
+  *
+  * Wayland implementation of host<->guest copy/paste, derived from
+  * copyPasteUIX11.cpp. Rather than owning an X selection through GtkClipboard,
+- * the local selection is owned through ext-data-control-v1 in
++ * the local selection is owned and read through ext-data-control-v1 in
+  * waylandClipboard.c. A data control client needs no keyboard focus, unlike
+  * the core wl_data_device protocol that GtkClipboard uses on Wayland. That is
+  * what allows a background daemon to bridge the clipboard.
+@@ -46,6 +46,140 @@ extern "C" {
+ }
+ 
+ 
++/*
++ * One request from the host can ask for several types in turn. Each read is
++ * bounded, but a sequence of them is not, and this runs on the main loop that
++ * also carries the RPC channel. Give the whole request one budget and let each
++ * read have what is left of it.
++ */
++#define CP_REQUEST_BUDGET_MS 2000
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandRemainingMs --
++ *
++ *    Time left until deadline.
++ *
++ * Results:
++ *    Milliseconds, 0 once the deadline has passed.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static unsigned int
++CopyPasteWaylandRemainingMs(gint64 deadline)   // IN: monotonic, microseconds
++{
++   gint64 left = deadline - g_get_monotonic_time();
++
++   if (left <= 0) {
++      return 0;
++   }
++   return (unsigned int)(left / 1000);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandHasType --
++ *
++ *    Return true when the local selection advertises mimeType. Callers check
++ *    this before reading a type.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static bool
++CopyPasteWaylandHasType(const gchar *mimeType,  // IN
++                        gint64 deadline)        // IN: monotonic, microseconds
++{
++   if (WaylandClipboard_IsAvailable()) {
++      return WaylandClipboard_HasType(mimeType);
++   }
++   return false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandGetData --
++ *
++ *    Read the local selection as mimeType, binary safe. Returns NULL and
++ *    leaves *outLen at 0 for an empty, unreadable, oversized or late
++ *    selection. The caller frees the result with g_free().
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static guchar *
++CopyPasteWaylandGetData(const gchar *mimeType,  // IN
++                        gint64 deadline,       // IN: monotonic, microseconds
++                        gsize *outLen)          // OUT
++{
++   if (WaylandClipboard_IsAvailable()) {
++      size_t n = 0;
++      void *d = WaylandClipboard_Receive(mimeType, &n,
++                                         CopyPasteWaylandRemainingMs(deadline));
++
++      if (outLen != NULL) {
++         *outLen = (gsize) n;
++      }
++      return (guchar *) d;
++   }
++
++   if (outLen != NULL) {
++      *outLen = 0;
++   }
++   return NULL;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteWaylandGetText --
++ *
++ *    Read the local Wayland clipboard as text. Returns a newly allocated,
++ *    NUL-terminated buffer, to be freed with g_free(), and stores its length
++ *    without the terminator in *outLen. Returns NULL when the clipboard is
++ *    empty, unreadable or not delivered before the deadline.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++static gchar *
++CopyPasteWaylandGetText(gsize *outLen,   // OUT
++                        gint64 deadline) // IN: monotonic, microseconds
++{
++   static const char *types[] = {
++      "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", NULL
++   };
++
++   *outLen = 0;
++
++   for (int i = 0; types[i] != NULL; i++) {
++      gsize n = 0;
++      guchar *d;
++
++      if (!CopyPasteWaylandHasType(types[i], deadline)) {
++         continue;
++      }
++      d = CopyPasteWaylandGetData(types[i], deadline, &n);
++      if (d != NULL) {
++         /* The caller treats this as a NUL terminated string. */
++         gchar *text = g_strndup((const gchar *) d, n);
++
++         g_free(d);
++         *outLen = n;
++         return text;
++      }
++   }
++   return NULL;
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -58,12 +192,15 @@ extern "C" {
+ 
+ CopyPasteUIWayland::CopyPasteUIWayland()
+  : mCP(NULL),
+-   mInited(false)
++   mInited(false),
++   mReadGeneration(G_MAXUINT64),
++   mRetriedGeneration(G_MAXUINT64)
+ {
+    GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
+    ASSERT(p);
+    mCP = p->GetCopyPasteMgr();
+    ASSERT(mCP);
++   CPClipboard_Init(&mClipboard);
+ }
+ 
+ 
+@@ -80,6 +217,7 @@ CopyPasteUIWayland::CopyPasteUIWayland()
+ CopyPasteUIWayland::~CopyPasteUIWayland()
+ {
+    WaylandClipboard_Exit();
++   CPClipboard_Destroy(&mClipboard);
+ }
+ 
+ 
+@@ -88,8 +226,8 @@ CopyPasteUIWayland::~CopyPasteUIWayland()
+  *
+  * CopyPasteUIWayland::Init --
+  *
+- *    Take the local selection through ext-data-control-v1 and connect to
+- *    the common-layer copy/paste signals.
++ *    Choose how to own and read the local selection and connect to the
++ *    common-layer copy/paste signals.
+  *    The RPC transport runs on the toolbox GLib main loop.
+  *
+  *-----------------------------------------------------------------------------
+@@ -104,7 +242,7 @@ CopyPasteUIWayland::Init()
+ 
+    /*
+     * Own the selection directly when the compositor implements
+-    * ext-data-control-v1.
++    * ext-data-control-v1. This has to happen before the baseline read below.
+     */
+    if (WaylandClipboard_Init()) {
+       g_debug("%s: using the native Wayland selection\n", __FUNCTION__);
+@@ -113,8 +251,22 @@ CopyPasteUIWayland::Init()
+                 "copy and paste is disabled\n", __FUNCTION__);
+    }
+ 
++   /*
++    * Establish a baseline before the first host request. Otherwise the guest's
++    * pre-existing clipboard looks new and overwrites a newer host clipboard as
++    * soon as the VM receives focus.
++    */
++   GetSelectionGeneration(&mReadGeneration);
++   gsize len = 0;
++   gchar *text = CopyPasteWaylandGetText(&len,
++      g_get_monotonic_time() + CP_REQUEST_BUDGET_MS * 1000);
++   mLastClipboardText.assign(text != NULL ? text : "", len);
++   g_free(text);
++
+    mCP->srcRecvClipChanged.connect(
+       sigc::mem_fun(this, &CopyPasteUIWayland::GetRemoteClipboardCB));
++   mCP->destRequestClipChanged.connect(
++      sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalClipboard));
+ 
+    mInited = true;
+    return true;
+@@ -141,6 +293,25 @@ CopyPasteUIWayland::VmxCopyPasteVersionChanged(RpcChannel *chan,  // IN: unused
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::ClearLastClipboard --
++ *
++ *    Forget every format recorded as last sent to or received from the host.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::ClearLastClipboard(void)
++{
++   mLastClipboardText.clear();
++   mLastClipboardImage.clear();
++   mLastClipboardRtf.clear();
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -163,6 +334,15 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+       return;
+    }
+ 
++   /*
++    * The host clipboard has changed, whether or not the clip can be
++    * installed here. Forget the earlier clips, so that a later guest copy
++    * equal to one of them still reaches the host. Each path below records
++    * what it installs. A guest selection left in place when nothing is
++    * installed is not read again until it changes. See GetLocalClipboard().
++    */
++   ClearLastClipboard();
++
+    /*
+     * Log every format the host offered. The host may attach a text rendering,
+     * such as a filename or URL, to an image copy, so the order in which the
+@@ -234,6 +414,315 @@ CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip)  // IN
+       g_warning("%s: could not install the local selection\n", __FUNCTION__);
+       return;
+    }
++
++   /*
++    * Record every format now on the local selection. Without this, the next
++    * host request would read a format off this client's own selection, take
++    * it for a new guest copy and send it back to the host.
++    */
++   if (haveImg) {
++      mLastClipboardImage.assign((const char *) imgBuf, imgSz);
++   }
++   if (haveRtf) {
++      mLastClipboardRtf.assign((const char *) rtfBuf, rtfSz);
++   }
++   if (text != NULL) {
++      mLastClipboardText.assign(text, textLen);
++   }
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::GetSelectionGeneration --
++ *
++ *    Get a number that changes whenever the local selection changes. The
++ *    native backend counts selection events.
++ *
++ * Results:
++ *    false when nothing counts the changes, which is where the compositor has
++ *    no ext-data-control-v1. Every request then reads the selection.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++CopyPasteUIWayland::GetSelectionGeneration(guint64 *generation)  // OUT
++{
++   if (WaylandClipboard_IsAvailable()) {
++      *generation = WaylandClipboard_GetSelectionSerial();
++      return true;
++   }
++   return false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::GetLocalClipboard --
++ *
++ *    Read the local selection and send it to the host. An image comes first,
++ *    then rich text with its plain text rendering, then plain text.
++ *    When copy and paste is allowed, every request gets one reply, with an
++ *    empty or not-changed clip when there is nothing new, so that the host
++ *    request does not hang.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::GetLocalClipboard(void)
++{
++   /*
++    * One budget for the whole request, shared by every read below. The host
++    * asks once, and a local selection owner must not hold the main loop for
++    * one timeout per type it advertises.
++    */
++   gint64 deadline = g_get_monotonic_time() + CP_REQUEST_BUDGET_MS * 1000;
++   guint64 generation = 0;
++   bool haveGeneration;
++   gsize len = 0;
++   gchar *text;
++   std::string currentRtf;
++   bool rtfInClip = false;
++   bool textInClip = false;
++
++   g_debug("%s: enter.\n", __FUNCTION__);
++
++   if (!mCP->IsCopyPasteAllowed()) {
++      g_debug("%s: copyPaste is not allowed\n", __FUNCTION__);
++      return;
++   }
++
++   /*
++    * When this client owns the selection, the selection holds what the host
++    * sent, so there is nothing new to report. Reading it back would send the
++    * host its own data.
++    */
++   if (WaylandClipboard_IsOwner()) {
++      g_debug("%s: we own the local selection, nothing new for the host\n",
++              __FUNCTION__);
++      SendClipNotChanged();
++      return;
++   }
++
++   /*
++    * Skip the reads when the selection has not changed since the last read.
++    * This also keeps a guest selection that was read before from being sent
++    * again after a host clip that could not be installed. The generation is
++    * taken before the reads, so that a change during them is read at the
++    * next request.
++    */
++   haveGeneration = GetSelectionGeneration(&generation);
++   if (haveGeneration) {
++      if (generation == mReadGeneration) {
++         g_debug("%s: the selection has not changed since the last read\n",
++                 __FUNCTION__);
++         SendClipNotChanged();
++         return;
++      }
++      mReadGeneration = generation;
++   }
++
++   CPClipboard_Clear(&mClipboard);
++
++   /*
++    * An image first, as in copyPasteUIX11.cpp. An image selection often also
++    * advertises a text/plain rendering, such as a filename or a URL, and
++    * reading the text would lose the image.
++    */
++   if (mCP->CheckCapability(DND_CP_CAP_IMAGE_CP) &&
++       CopyPasteWaylandHasType("image/png", deadline)) {
++      gsize imgLen = 0;
++      guchar *img = CopyPasteWaylandGetData("image/png", deadline, &imgLen);
++
++      if (img != NULL) {
++         std::string currentImage((const char *) img, imgLen);
++
++         if (currentImage == mLastClipboardImage) {
++            g_debug("%s: local clipboard image is unchanged\n", __FUNCTION__);
++            g_free(img);
++            SendClipNotChanged();
++            return;
++         }
++         if (CPClipboard_SetItem(&mClipboard, CPFORMAT_IMG_PNG, img, imgLen)) {
++            g_debug("%s: got %" G_GSIZE_FORMAT " bytes of PNG\n",
++                    __FUNCTION__, imgLen);
++            /*
++             * Record the image only once it is on the outgoing clip. Caching
++             * it before CPClipboard_SetItem() succeeds would make a failed
++             * attempt look unchanged the next time, and the same image could
++             * then never be copied again.
++             */
++            ClearLastClipboard();
++            mLastClipboardImage = currentImage;
++            g_free(img);
++            SendLocalClip();
++            return;
++         }
++         g_debug("%s: failed to set PNG item, falling back to text\n",
++                 __FUNCTION__);
++         g_free(img);
++      }
++   }
++
++   /*
++    * Rich text before plain text. A rich text selection also offers a plain
++    * rendering, and taking only that would drop the formatting on the way to
++    * the host. The plain rendering goes in the same clip below, as the X11
++    * backends send it, for a host application that takes plain text only.
++    */
++   if (mCP->CheckCapability(DND_CP_CAP_RTF_CP)) {
++      const char *rtfTypes[] = {
++         TARGET_NAME_TEXT_RTF, TARGET_NAME_APPLICATION_RTF, NULL
++      };
++      int i;
++
++      for (i = 0; rtfTypes[i] != NULL && !rtfInClip; i++) {
++         gsize rtfLen = 0;
++         guchar *rtf;
++
++         if (!CopyPasteWaylandHasType(rtfTypes[i], deadline)) {
++            continue;
++         }
++         rtf = CopyPasteWaylandGetData(rtfTypes[i], deadline, &rtfLen);
++         if (rtf == NULL || rtfLen == 0) {
++            g_free(rtf);
++            continue;
++         }
++
++         currentRtf.assign((const char *) rtf, rtfLen);
++         if (currentRtf == mLastClipboardRtf) {
++            g_debug("%s: local clipboard rtf is unchanged\n", __FUNCTION__);
++            g_free(rtf);
++            SendClipNotChanged();
++            return;
++         }
++         if (CPClipboard_SetItem(&mClipboard, CPFORMAT_RTF, rtf, rtfLen)) {
++            g_debug("%s: got %" G_GSIZE_FORMAT " bytes of %s\n", __FUNCTION__,
++                    rtfLen, rtfTypes[i]);
++            rtfInClip = true;
++         }
++         g_free(rtf);
++      }
++   }
++
++   text = CopyPasteWaylandGetText(&len, deadline);
++
++   if (text == NULL && !rtfInClip &&
++       CopyPasteWaylandRemainingMs(deadline) == 0) {
++      /*
++       * The reads ran out of time, so this request learned nothing about the
++       * selection. Read it again at the next request rather than wait for
++       * the next change, which may never come. Only once per change,
++       * because an owner that never answers would otherwise cost the full
++       * budget on the main loop at every request.
++       */
++      g_debug("%s: the reads ran out of time\n", __FUNCTION__);
++      if (haveGeneration && mRetriedGeneration != generation) {
++         mRetriedGeneration = generation;
++         mReadGeneration = G_MAXUINT64;
++      }
++      SendClipNotChanged();
++      return;
++   }
++
++   /*
++    * The generation above says that something changed. Copying the same
++    * text again is such a change, and so is a clipboard manager taking over
++    * the selection this client installed. So the content is compared too,
++    * and the same text again reads as unchanged.
++    */
++   std::string currentText(text != NULL ? text : "", len);
++   if (!rtfInClip && currentText == mLastClipboardText) {
++      g_debug("%s: local clipboard is unchanged\n", __FUNCTION__);
++      g_free(text);
++      SendClipNotChanged();
++      return;
++   }
++   if (text != NULL && len > 0) {
++      if (!mCP->CheckCapability(DND_CP_CAP_PLAIN_TEXT_CP)) {
++         g_debug("%s: plain text copy/paste not in caps\n", __FUNCTION__);
++      } else if (!g_utf8_validate(text, len, NULL)) {
++         g_debug("%s: clipboard data is not valid UTF-8 text, skipping\n",
++                 __FUNCTION__);
++      } else if (len + 1 > (gsize) CPCLIPITEM_MAX_SIZE_V3) {
++         g_debug("%s: clipboard text too large (%" G_GSIZE_FORMAT " bytes)\n",
++                 __FUNCTION__, len);
++      } else if (CPClipboard_SetItem(&mClipboard, CPFORMAT_TEXT, text, len + 1)) {
++         textInClip = true;
++         g_debug("%s: got %" G_GSIZE_FORMAT " bytes of text\n", __FUNCTION__, len);
++      }
++   }
++   g_free(text);
++
++   if (rtfInClip || textInClip) {
++      /*
++       * Record what is on the outgoing clip, for the same reason as the
++       * image above.
++       */
++      ClearLastClipboard();
++      if (rtfInClip) {
++         mLastClipboardRtf = currentRtf;
++      }
++      if (textInClip) {
++         mLastClipboardText = currentText;
++      }
++   } else {
++      g_debug("%s: no text, sending empty clip back.\n", __FUNCTION__);
++   }
++   SendLocalClip();
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::SendLocalClip --
++ *
++ *    Send the guest selection read into mClipboard to the host.
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    Sends an RPC to the host.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::SendLocalClip(void)
++{
++   mCP->DestUISendClip(&mClipboard);
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * CopyPasteUIWayland::SendClipNotChanged --
++ *
++ *    Send a not-changed clip to host.
++ *
++ * Results:
++ *    None.
++ *
++ * Side effects:
++ *    None.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++CopyPasteUIWayland::SendClipNotChanged(void)
++{
++   CPClipboard clip;
++
++   CPClipboard_Init(&clip);
++   CPClipboard_SetChanged(&clip, FALSE);
++   mCP->DestUISendClip(&clip);
++   CPClipboard_Destroy(&clip);
++}
+diff --git a/services/plugins/dndcp/copyPasteUIWayland.h b/services/plugins/dndcp/copyPasteUIWayland.h
+index 7249a4f..e9e3b32 100644
+--- a/services/plugins/dndcp/copyPasteUIWayland.h
++++ b/services/plugins/dndcp/copyPasteUIWayland.h
+@@ -20,7 +20,7 @@
+  * @file copyPasteUIWayland.h
+  *
+  * This class implements host<->guest copy/paste (version 3+ of the protocol)
+- * for Wayland sessions. The local selection is owned through
++ * for Wayland sessions. The local selection is owned and read through
+  * ext-data-control-v1 where the compositor implements it. This is the
+  * counterpart of copyPasteUIX11.h for the Wayland platform.
+  *
+@@ -60,9 +60,25 @@ public:
+ private:
+    /* Called when the host sends new clipboard contents. */
+    void GetRemoteClipboardCB(const CPClipboard *clip);
++   /* Called when the host asks for the guest clipboard. */
++   void GetLocalClipboard(void);
++   void SendClipNotChanged(void);
++   void SendLocalClip(void);
++   /* Forget the formats recorded in mLastClipboard*. */
++   void ClearLastClipboard(void);
+ 
+    GuestCopyPasteMgr *mCP;
++   CPClipboard mClipboard;
++   std::string mLastClipboardText;
++   std::string mLastClipboardImage;
++   std::string mLastClipboardRtf;
+    bool mInited;
++
++   bool GetSelectionGeneration(guint64 *generation);
++   /* The generation last read. See GetLocalClipboard(). */
++   guint64 mReadGeneration;
++   /* The generation last read again after its reads ran out of time. */
++   guint64 mRetriedGeneration;
+ };
+ 
+ #endif // __COPYPASTE_UI_WAYLAND_H__
+-- 
+2.55.0
+

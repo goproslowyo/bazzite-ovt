@@ -1,0 +1,468 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:11 -0700
+Subject: [PATCH 17/21] dndcp: Stage placeholders and block only at the drop of
+ a file drag
+
+The offered URIs must be resolvable while the target decides. They name
+vmblock paths, and a lookup under a vmblock entry blocks until the host
+sends the file. A file manager that resolves the URI to decide would
+stall its own main loop, and one that cannot stat what it is offered
+refuses the drop.
+
+For every host to guest file drag, native or XDND, stage an empty
+placeholder for each file and directory at drag begin, and add the block
+at the drop instead, before the button is released. Thunar on Xfce, on
+Xorg, refused every XDND drop while the block was in place from the
+start. The block then holds the target's read until the
+files arrive. The names pass LocalIsSafeStagingName() here as well. When
+the placeholders cannot be staged, the drag adds the block at once, as
+before. A drag that ends without the host's files removes its
+placeholders, which a target would otherwise read as empty files.
+
+The host decides when GET_FILES_DONE arrives, and it can arrive before
+the drop. It then cancels the pending block. Otherwise the drop would
+add a block that nothing removes, and the application that took the drop
+would wait in open() forever.
+
+RemoveBlock() now removes the block from the path it was added on. A
+block that an earlier drag left on another directory is released before
+a new one is added, rather than taken for the new drag's block.
+---
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |   8 +
+ services/plugins/dndcp/dndUIX11GTK4.cpp       | 287 +++++++++++++++++-
+ 2 files changed, 283 insertions(+), 12 deletions(-)
+
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index d1cd78e..19ad04d 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -80,6 +80,10 @@ private:
+     */
+    void AddBlock();
+    void RemoveBlock();
++   bool LocalWaylandDragPreferred(void);
++   bool StageFilePlaceholders(const DnDFileList &fList);
++   void ClearFilePlaceholders(void);
++   void AddBlockForDrop(void);
+    void
+    BuildFileURIList(utf::string& uriList,
+                     utf::string pre,
+@@ -227,6 +231,8 @@ private:
+    DnDBlockControl *mBlockCtrl;
+    DND_FILE_TRANSFER_STATUS mHGGetFileStatus;
+    bool mBlockAdded;
++   /* The path the current block was added on, which RemoveBlock() removes. */
++   utf::string mBlockedPath;
+ 
+    /* State to determine if drag motion is a drag enter. */
+    bool mGHDnDInProgress;
+@@ -244,6 +250,8 @@ private:
+    bool mWaylandDragActive;
+    /* Which native drag is current; a done() for any other is ignored. */
+    unsigned int mWaylandDragGen;
++   /* The staging directory holds placeholders, and the drop adds the block. */
++   bool mHGDeferBlock;
+    DND_DROPEFFECT mEffect;
+    int32 mMousePosX;
+    int32 mMousePosY;
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index 5c99dfd..2937cee 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -38,6 +38,7 @@ extern "C" {
+ 
+ #include "copyPasteCompat.h"
+ #include "dndClipboard.h"
++#include "hgfs.h"
+ #include "hgfsUri.h"
+ #include "rpcout.h"
+ }
+@@ -56,6 +57,9 @@ extern "C" {
+ #include "copyPasteDnDWrapper.h"
+ #include "waylandDrag.h"
+ 
++#include <fcntl.h>
++#include <glib/gstdio.h>
++
+ /*
+  * How long to wait for the compositor to deliver a faked press. The wait
+  * ends as soon as the press arrives. The full time passes only when the
+@@ -91,6 +95,7 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
+       mHGButtonDown(false),
+       mWaylandDragActive(false),
+       mWaylandDragGen(0),
++      mHGDeferBlock(false),
+       mEffect(DROP_NONE),
+       mMousePosX(0),
+       mMousePosY(0),
+@@ -325,10 +330,208 @@ DnDUIX11::ResetUI()
+    mEffect = DROP_NONE;
+    mInHGDrag = false;
+    CancelGHRead();
++   ClearFilePlaceholders();
+    RemoveBlock();
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::LocalWaylandDragPreferred --
++ *
++ *      Whether the drag about to start will try the native Wayland source
++ *      before XDND.
++ *
++ *      The source is chosen when the first motion arrives, and the native one
++ *      can still fail then and fall back to XDND. The staging decisions have
++ *      to be made before the offer is built, so they are made on these
++ *      conditions.
++ *
++ * Results:
++ *      True if the native source will be tried.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DnDUIX11::LocalWaylandDragPreferred(void)
++{
++#ifdef USE_UINPUT
++   return WaylandDrag_IsAvailable() && FakeMouse_IsInit();
++#else
++   return false;
++#endif
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::StageFilePlaceholders --
++ *
++ *      Create an empty entry in the staging directory for every file the host
++ *      is dragging.
++ *
++ *      A file manager stats the URIs it is offered while the pointer is still
++ *      moving, to decide whether it can take the drop at all, and refuses
++ *      what it cannot stat. Nothing is in the staging directory until the
++ *      host has dropped, so without this the offer never becomes acceptable.
++ *      The entries are only placeholders. AddBlockForDrop() adds the block at
++ *      drop time, and the block keeps readers out until the host has filled
++ *      the entries in.
++ *
++ * Results:
++ *      True if the whole list was staged, in which case the caller owns the
++ *      entries until the transfer finishes or the drag is cancelled.
++ *
++ * Side effects:
++ *      Creates files and directories under mHGStagingDir.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++bool
++DnDUIX11::StageFilePlaceholders(const DnDFileList &fList)   // IN
++{
++   std::vector<std::string> relPaths = fList.GetRelPaths();
++   std::vector<CPFileAttributes> attrs = fList.GetFileAttributes();
++   utf::string root = mHGStagingDir;
++   size_t i;
++
++   if (   mBlockCtrl == NULL
++       || !DnD_BlockIsReady(mBlockCtrl)
++       || root.empty()
++       || relPaths.empty()) {
++      return false;
++   }
++   while (root.length() > 1 && root[root.length() - 1] == DIRSEPC) {
++      root.erase(root.length() - 1);
++   }
++
++   for (i = 0; i < relPaths.size(); i++) {
++      const std::string &rel = relPaths[i];
++      bool isDir =    i < attrs.size()
++                   && attrs[i].fileType == HGFS_FILE_TYPE_DIRECTORY;
++      std::string full;
++      char *parent;
++      bool ok;
++
++      /*
++       * The list comes from the host. Each name becomes a path under the
++       * staging directory and then an entry in a uri-list. The file contents
++       * path uses the same check.
++       */
++      if (!LocalIsSafeStagingName(rel.c_str(), rel.size() + 1)) {
++         g_debug("%s: refusing relative path [%s]\n", __FUNCTION__,
++                 rel.c_str());
++         goto error;
++      }
++
++      full = std::string(root.c_str()) + DIRSEPS + rel;
++      parent = isDir ? g_strdup(full.c_str())
++                     : g_path_get_dirname(full.c_str());
++      ok = g_mkdir_with_parents(parent, 0755) == 0;
++      g_free(parent);
++      if (!ok) {
++         g_debug("%s: cannot create directories for %s: %s\n", __FUNCTION__,
++                 full.c_str(), g_strerror(errno));
++         goto error;
++      }
++      if (!isDir) {
++         int fd = g_open(full.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
++
++         if (fd < 0) {
++            g_debug("%s: cannot create %s: %s\n", __FUNCTION__, full.c_str(),
++                    g_strerror(errno));
++            goto error;
++         }
++         close(fd);
++      }
++   }
++
++   g_debug("%s: staged %" FMTSZ "u placeholders under %s\n", __FUNCTION__,
++           (size_t)relPaths.size(), root.c_str());
++   return true;
++
++error:
++   DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
++   return false;
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::AddBlockForDrop --
++ *
++ *      Add the block now, just before the target reads.
++ *
++ *      The staged entries are placeholders until the host fills them in, so
++ *      the block has to hold the target's read until OnGetFilesDone() reports
++ *      that the bytes are there. It must not go in earlier. While the target
++ *      is still deciding whether to take the drop, it has to be able to stat
++ *      what it was offered.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::AddBlockForDrop(void)
++{
++   if (!mHGDeferBlock) {
++      return;
++   }
++   AddBlock();
++   /* From here on the host fills in the staged entries. */
++   mHGDeferBlock = false;
++
++   /*
++    * With no block the target reads the placeholders as they are, and
++    * copies a set of empty files as if they were the drop. Without them it
++    * finds nothing, and fails the drop where the user can see it.
++    */
++   if (!mBlockAdded && !mHGStagingDir.empty()) {
++      g_warning("%s: no block for %s; withdrawing the placeholders\n",
++                __FUNCTION__, mHGStagingDir.c_str());
++      DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
++   }
++}
++
++
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DnDUIX11::ClearFilePlaceholders --
++ *
++ *      Undo StageFilePlaceholders() where the host never sent the files.
++ *
++ *      Left behind they would look to a target like empty files, and they
++ *      would also stop the staging directory from being reused.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DnDUIX11::ClearFilePlaceholders(void)
++{
++   /*
++    * The drop and OnGetFilesDone() clear the flag, so a set flag here means
++    * the host sent nothing.
++    */
++   if (!mHGDeferBlock) {
++      return;
++   }
++   mHGDeferBlock = false;
++   if (mHGStagingDir.empty()) {
++      return;
++   }
++   g_debug("%s: dropping the placeholders in %s\n", __FUNCTION__,
++           mHGStagingDir.c_str());
++   DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
++}
++
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -351,8 +554,23 @@ DnDUIX11::AddBlock()
+    TRACE_CALL();
+ 
+    if (mBlockAdded) {
+-      g_debug("%s: block already added\n", __FUNCTION__);
+-      return;
++      if (mBlockedPath == mHGStagingDir) {
++         g_debug("%s: block already added\n", __FUNCTION__);
++         return;
++      }
++      /*
++       * A block still in place on another directory belongs to a drag that
++       * is over, and mBlockAdded refers to that block. Treating it as this
++       * drag's block would leave this directory unblocked and aim the later
++       * removal at the wrong path.
++       */
++      g_debug("%s: releasing the block left on %s\n", __FUNCTION__,
++              mBlockedPath.c_str());
++      if (DnD_BlockIsReady(mBlockCtrl)) {
++         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mBlockedPath.c_str());
++      }
++      mBlockAdded = false;
++      mBlockedPath = "";
+    }
+ 
+    g_debug("%s: DnDBlockIsReady %d fd %d\n", __FUNCTION__,
+@@ -361,6 +579,7 @@ DnDUIX11::AddBlock()
+    if (   DnD_BlockIsReady(mBlockCtrl)
+        && mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str())) {
+       mBlockAdded = true;
++      mBlockedPath = mHGStagingDir;
+       g_debug("%s: add block for %s.\n", __FUNCTION__, mHGStagingDir.c_str());
+    } else {
+       mBlockAdded = false;
+@@ -391,12 +610,14 @@ DnDUIX11::RemoveBlock()
+    TRACE_CALL();
+ 
+    if (mBlockAdded && (DND_FILE_TRANSFER_IN_PROGRESS != mHGGetFileStatus)) {
+-      g_debug("%s: removing block for %s\n", __FUNCTION__, mHGStagingDir.c_str());
++      /* mBlockedPath is where the block went in. mHGStagingDir may differ. */
++      g_debug("%s: removing block for %s\n", __FUNCTION__, mBlockedPath.c_str());
+       /* We need to make sure block subsystem has not been shut off. */
+       if (DnD_BlockIsReady(mBlockCtrl)) {
+-         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
++         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mBlockedPath.c_str());
+       }
+       mBlockAdded = false;
++      mBlockedPath = "";
+    } else {
+       g_debug("%s: not removing block mBlockAdded %d mHGGetFileStatus %d\n",
+               __FUNCTION__, mBlockAdded, mHGGetFileStatus);
+@@ -527,7 +748,7 @@ DnDUIX11::BuildFileURIList(utf::string& uriList,         // IN/OUT
+    while ((str = GetNextPath(mHGFCPData, pos).c_str()).bytes() != 0) {
+       g_debug("%s: Path: %s", __FUNCTION__, str.c_str());
+       uriList += pre;
+-      if (mBlockAdded) {
++      if (mBlockAdded || mHGDeferBlock) {
+          uriList += mBlockCtrl->blockRoot;
+          uriList += DIRSEPS + stagingDirName + DIRSEPS + str + post;
+       } else {
+@@ -829,10 +1050,12 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+       }
+ 
+       /*
+-       * Every name below goes into the uri-list with only percent escaping,
+-       * and resolves under the vmblock mount. A name that leads out of the
+-       * staging directory, or ends a uri-list entry early, publishes a path
+-       * where nothing was staged.
++       * For both drag sources every name below goes into the uri-list with
++       * only percent escaping, and resolves under the vmblock mount. A name
++       * that leads out of the staging directory, or ends a uri-list entry
++       * early, publishes a path where nothing was staged.
++       * StageFilePlaceholders() checks again, and when it fails the drag
++       * continues with an ordinary block.
+        */
+       if (!LocalFileListIsSafe(fList)) {
+          g_warning("%s: refusing a file list with an unusable name\n",
+@@ -844,10 +1067,27 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+       // Provide path within vmblock file system instead of actual path.
+       mHGFCPData = fList.GetRelPathsStr();
+ 
+-      if (!mBlockAdded) {
++      /*
++       * A vmblock entry makes every lookup below the staging directory wait,
++       * path resolution included, and a file manager such as Thunar stats
++       * what it is offered while the pointer is still over it. A block added
++       * here would stall the target, and the target would refuse the drop.
++       * The files are therefore staged empty, and the block is added at the
++       * drop, the first moment the bytes have to be right. This holds for
++       * the native drag and for XDND alike.
++       */
++      {
++         void *attrBuf;
++         size_t attrSz;
++
++         if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILEATTRIBUTES,
++                                 &attrBuf, &attrSz)) {
++            fList.AttributesFromCPClipboard(attrBuf, attrSz);
++         }
++         mHGDeferBlock = StageFilePlaceholders(fList);
++      }
++      if (!mHGDeferBlock) {
+          AddBlock();
+-      } else {
+-         g_debug("%s: not calling AddBlock\n", __FUNCTION__);
+       }
+       if (mHGGetFileStatus != DND_FILE_TRANSFER_IN_PROGRESS) {
+          mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
+@@ -1210,6 +1450,7 @@ DnDUIX11::OnSrcCancel()
+    mInHGDrag = false;
+    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+    mEffect = DROP_NONE;
++   ClearFilePlaceholders();
+    RemoveBlock();
+ }
+ 
+@@ -1322,12 +1563,14 @@ DnDUIX11::OnSrcDrop()
+        * connection only.
+        */
+       FakeMouse_Move(mMousePosX, mMousePosY);
++      AddBlockForDrop();
+       FakeMouse_Click(false);
+       mHGButtonDown = false;
+       mInHGDrag = false;
+       return;
+    }
+ #endif
++   AddBlockForDrop();
+    ShowDetWnd(true, mOriginX, mOriginY, DET_WND_DRAG_SOURCE);
+ 
+    /*
+@@ -1371,6 +1614,26 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
+ 
+    mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+ 
++   /*
++    * The host decides when this arrives, and the RPC layer does not check
++    * that a transfer was requested, so it can arrive before the drop at
++    * which OnSrcDrop() adds the block. The RemoveBlock() below then does
++    * nothing, and the drop would add a block that nothing removes. The
++    * application that took the drop would then wait in open() forever.
++    * Clear mHGDeferBlock so that the drop adds no block. The uri-list still
++    * names the files through the vmblock mount, which passes lookups
++    * straight through to the files the host has written when the staging
++    * directory has no block.
++    *
++    * Only mHGDeferBlock says that this drag's block is still to come.
++    * mBlockAdded can be left over from another drag, and checking it here
++    * would let the drop add the block anyway.
++    */
++   if (mHGDeferBlock) {
++      g_debug("%s: files done before the drop; not blocking\n", __FUNCTION__);
++      mHGDeferBlock = false;
++   }
++
+    if (!mInHGDrag) {
+       ResetUI();
+    } else {
+-- 
+2.55.0
+

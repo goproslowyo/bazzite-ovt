@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 21:25:09 -0700
+Subject: [PATCH 03/21] dndcp: Keep the faked pointer on screen, never leave
+ its button down
+
+XOpenDisplay() can return NULL, and the uinput setup used the result
+without checking. The daemon then crashed while registering drag and
+drop instead of falling back to XTest. This happens with a compositor
+that starts Xwayland on demand and stops it when the last client exits,
+as sway does.
+
+A press is faked through uinput to start a host to guest drag, and the
+host releases it when it drops. If the drag never starts there is no
+drop and no release. A button left down holds the pointer in a drag for
+the rest of the session, and to the user the desktop looks frozen.
+Release it when the UI is reset, where the host last had the pointer,
+without moving the detection window. The X server's idea of the pointer
+is stale while it is over a Wayland surface, and the host can still be
+dragging. The reset also runs from the destructor, which has already
+deleted the detection window, so the release has to work without one.
+
+The host's coordinates go to the uinput device unchecked. Clamp them in
+FakeMouse_Move(), which every uinput move goes through, to the range the
+device was declared with. The X server keeps a warp or an XTest motion
+on the screen by itself.
+
+That range is the screen size when the device was created. After a
+resolution change the compositor scales the old range onto the new
+output, and the clamp cuts off coordinates beyond the old size. The
+device is now recreated when the screen size has changed, checked at the
+start of each drag in either direction, as the GTK3 build already does.
+
+Set INPUT_PROP_DIRECT and INPUT_PROP_POINTER on the uinput device.
+Without a property the kernel also exposes the device as a joystick, and
+libinput misclassifies it, which has broken the side buttons of a real
+mouse.
+---
+ .../plugins/dndcp/dndGuestBase/dndUIX11GTK4.h |  2 +
+ .../dndcp/dndGuestBase/dragDetWndX11GTK4.h    |  1 +
+ services/plugins/dndcp/dndUIX11GTK4.cpp       | 30 +++++++
+ services/plugins/dndcp/dragDetWndX11GTK4.cpp  | 86 +++++++++++++++++--
+ .../fakeMouseWayland/fakeMouseWayland.cpp     | 43 ++++++++++
+ 5 files changed, 154 insertions(+), 8 deletions(-)
+
+diff --git a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+index 572e5b9..4e29064 100644
+--- a/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dndUIX11GTK4.h
+@@ -189,6 +189,8 @@ private:
+    bool mInHGDrag;
+    // Flag to indicate if H->G drag has been triggered in guest by simulate mouse press
+    bool mHGDragStarted;
++   /* A faked press is outstanding; it must not outlive the drag. */
++   bool mHGButtonDown;
+    DND_DROPEFFECT mEffect;
+    int32 mMousePosX;
+    int32 mMousePosY;
+diff --git a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+index d06b021..e76787e 100644
+--- a/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
++++ b/services/plugins/dndcp/dndGuestBase/dragDetWndX11GTK4.h
+@@ -75,6 +75,7 @@ public:
+                         const bool buttonPress, const bool moveWindow,
+                         const bool coordsProvided,
+                         const int xCoord, const int yCoord);
++   void RefreshScreenSize(void);
+    void StartDrag(Glib::RefPtr<Gdk::ContentProvider> provider,
+                   int mouseX,
+                   int mouseY);
+diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
+index 3765e9a..e4c2387 100644
+--- a/services/plugins/dndcp/dndUIX11GTK4.cpp
++++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
+@@ -77,6 +77,7 @@ DnDUIX11::DnDUIX11(ToolsAppCtx *ctx)
+       mGHDnDInProgress(false),
+       mGHDnDDataReceived(false),
+       mInHGDrag(false),
++      mHGButtonDown(false),
+       mEffect(DROP_NONE),
+       mMousePosX(0),
+       mMousePosY(0),
+@@ -253,6 +254,26 @@ void
+ DnDUIX11::ResetUI()
+ {
+    TRACE_CALL();
++   /*
++    * The press faked to start a host to guest drag is released by the host
++    * when it drops. If the drag never started there is nothing to drop, and
++    * a button left down through uinput holds the pointer in a drag for the
++    * whole session, which looks to the user like the desktop has frozen.
++    */
++   if (mHGButtonDown) {
++      /* The destructor deletes the detection window before it resets. */
++      if (mDetWnd != NULL) {
++         g_debug("%s: releasing the faked button\n", __FUNCTION__);
++         /*
++          * Release where the host has the pointer. The X server's idea of
++          * the pointer is stale while it is over a Wayland surface, and the
++          * host can still be dragging, so leave the window where it is.
++          */
++         mDetWnd->SimulateXEvents(false, true, false, false, true,
++                                  mMousePosX, mMousePosY);
++      }
++      mHGButtonDown = false;
++   }
+    mGHDnDDataReceived = false;
+    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+    mGHDnDInProgress = false;
+@@ -653,6 +674,9 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+    bool hasContent = false;
+    mHGDragStarted = false;
+ 
++   /* The host's coordinates are for the screen as it is now. */
++   mDetWnd->RefreshScreenSize();
++
+    /* Move detect window to the mouse in position */
+    OnUpdateDetWnd(true, mOriginX, mOriginY);
+ 
+@@ -781,6 +805,7 @@ DnDUIX11::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+          mDetWnd->SimulateXEvents(true, true, false, true, true, x, y);
+          // simulate drag mouse press
+          mDetWnd->SimulateXEvents(false, true, true, false, true, x, y);
++         mHGButtonDown = true;
+          // Tell Gtk that a drag should be started from this widget.
+          mDetWnd->StartDrag(mProvider, x, y);
+          mHGDragStarted = true;
+@@ -827,6 +852,8 @@ DnDUIX11::OnSrcCancel()
+    OnUpdateDetWnd(false, 0, 0);
+    mDetWnd->SimulateXEvents(false, false, false, false, true,
+                            mMousePosX, mMousePosY);
++   /* The real release has been sent; ResetUI() need not send another. */
++   mHGButtonDown = false;
+    mInHGDrag = false;
+    mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+    mEffect = DROP_NONE;
+@@ -939,6 +966,8 @@ DnDUIX11::OnSrcDrop()
+    mDetWnd->SimulateXEvents(false, true, false, false, true,
+                             mMousePosX, mMousePosY);
+    OnUpdateDetWnd(false, 0, 0);
++   /* The real release has been sent; ResetUI() need not send another. */
++   mHGButtonDown = false;
+    /* We've successful or failure for HG drag, set the flag to false anyway */
+    mInHGDrag = false;
+ }
+@@ -1037,6 +1066,7 @@ DnDUIX11::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
+ void
+ DnDUIX11::OnDestMoveDetWndToMousePos()
+ {
++   mDetWnd->RefreshScreenSize();
+    mDetWnd->SimulateXEvents(true, false, true, true, false, 0, 0);
+ }
+ 
+diff --git a/services/plugins/dndcp/dragDetWndX11GTK4.cpp b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+index 3ed7bcd..48fb338 100644
+--- a/services/plugins/dndcp/dragDetWndX11GTK4.cpp
++++ b/services/plugins/dndcp/dragDetWndX11GTK4.cpp
+@@ -102,15 +102,26 @@ DragDetWnd::DragDetWnd(int useUInput_fd)
+    if (useUInput_fd != -1) {
+        g_debug("%s: Using uinput simulation", __FUNCTION__);
+        Display *display = XOpenDisplay(NULL);
+-       Screen * scrn = DefaultScreenOfDisplay(display);
+-       if (FakeMouse_Init(useUInput_fd, scrn->width, scrn->height)) {
+-           mUseUInput = true;
+-           mScreenWidth = scrn->width;
+-           mScreenHeight = scrn->height;
+-           g_debug("%s: mScreenWidth is %d, mScreenHeight is %d", __FUNCTION__, mScreenWidth, mScreenHeight);
++
++       /*
++        * A compositor may start Xwayland on demand and stop it again when
++        * the last client goes, so there is not always a server to ask. The
++        * pointer then moves through XTest instead, which needs no screen
++        * size from here.
++        */
++       if (display != NULL) {
++           Screen * scrn = DefaultScreenOfDisplay(display);
++           if (FakeMouse_Init(useUInput_fd, scrn->width, scrn->height)) {
++               mUseUInput = true;
++               mScreenWidth = scrn->width;
++               mScreenHeight = scrn->height;
++               g_debug("%s: mScreenWidth is %d, mScreenHeight is %d", __FUNCTION__, mScreenWidth, mScreenHeight);
++           }
++           // Disconnect the connection to X Server.
++           XCloseDisplay(display);
++       } else {
++           g_warning("%s: no X display, uinput disabled\n", __FUNCTION__);
+        }
+-       // Disconnect the connection to X Server.
+-       XCloseDisplay(display);
+    }
+ #endif
+    return;
+@@ -141,6 +152,61 @@ DragDetWnd::~DragDetWnd()
+ }
+ 
+ 
++/*
++ *-----------------------------------------------------------------------------
++ *
++ * DragDetWnd::RefreshScreenSize --
++ *
++ *    Update the uinput device after a change of screen size.
++ *
++ *    The device declares its absolute range when it is created, and
++ *    FakeMouse_Move() clamps to the size it was created with. After a
++ *    resolution change the range describes the old screen. The compositor
++ *    scales the old range onto the new output, and the clamp cuts off
++ *    coordinates beyond the old size. The GTK3 build checks the screen
++ *    size in DnDUIX11::OnSrcDragBegin() for the same reason.
++ *
++ *    This opens a fresh connection, because Xlib updates the screen size of
++ *    an open connection only for a client that processes RandR events itself.
++ *
++ * Side effects:
++ *    Recreates the uinput device if the size has changed. If that fails the
++ *    pointer goes back to XTest.
++ *
++ *-----------------------------------------------------------------------------
++ */
++
++void
++DragDetWnd::RefreshScreenSize(void)
++{
++#ifdef USE_UINPUT
++   Display *display;
++   Screen *scrn;
++
++   if (!mUseUInput) {
++      return;
++   }
++   display = XOpenDisplay(NULL);
++   if (display == NULL) {
++      return;
++   }
++   scrn = DefaultScreenOfDisplay(display);
++   if (scrn->width != mScreenWidth || scrn->height != mScreenHeight) {
++      g_debug("%s: screen is now %dx%d, was %dx%d\n", __FUNCTION__,
++              scrn->width, scrn->height, mScreenWidth, mScreenHeight);
++      if (FakeMouse_Update(scrn->width, scrn->height)) {
++         mScreenWidth = scrn->width;
++         mScreenHeight = scrn->height;
++      } else {
++         g_warning("%s: could not recreate the uinput device\n", __FUNCTION__);
++         mUseUInput = false;
++      }
++   }
++   XCloseDisplay(display);
++#endif
++}
++
++
+ /**
+  * Get the actual widget.
+  */
+@@ -984,6 +1050,10 @@ DragDetWnd::SimulateXEvents(const bool showWidget, const bool buttonEvent,
+    /*
+     * Generate mouse movements over the window.  The second one makes ungrabs
+     * happen more reliably on KDE, but isn't necessary on GNOME.
++    *
++    * The coordinates may have come straight from the host. FakeMouse_Move()
++    * keeps them within the range of the uinput device, and the X server
++    * keeps a warp or an XTest motion on the screen.
+     */
+    if (mUseUInput) {
+ #ifdef USE_UINPUT
+diff --git a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
+index 0311a4e..30ddfb2 100644
+--- a/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
++++ b/services/plugins/dndcp/fakeMouseWayland/fakeMouseWayland.cpp
+@@ -43,6 +43,10 @@ static int uinput_fd = -1;
+ // Indicates if the uinput device is created
+ static bool isInit = false;
+ 
++// The screen the uinput device was told about, for clamping what it is given.
++static int screenWidth = 0;
++static int screenHeight = 0;
++
+ /*
+  *-----------------------------------------------------------------------------
+  *
+@@ -98,6 +102,8 @@ FakeMouse_Init(int fd,       // fd for uinput
+    if (uinput_fd == -1) {
+       return false;
+    }
++   screenWidth = width;
++   screenHeight = height;
+ 
+    /*
+     * The uinput old interface is used for compatibility.
+@@ -141,6 +147,26 @@ FakeMouse_Init(int fd,       // fd for uinput
+       g_debug("%s: Failed to register UI_SET_KEYBIT BTN_LEFT\n", __FUNCTION__);
+       goto exit;
+    }
++
++   /*
++    * Without an INPUT_PROP_* bit, udev and libinput cannot tell what kind of
++    * device this is. The kernel also exposes it as a joystick:
++    *   N: Name="VMware DnD UInput pointer"
++    *   H: Handlers=mouse4 event7 js1
++    *   B: PROP=0
++    * libinput then misclassifies it, and that has broken other pointer
++    * features, such as the side buttons on a real mouse. The device reports
++    * absolute coordinates over the whole screen, so declare it a direct
++    * pointing device.
++    */
++   if (ioctl(uinput_fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT) < 0) {
++      g_debug("%s: Failed to register UI_SET_PROPBIT INPUT_PROP_DIRECT\n",
++              __FUNCTION__);
++   }
++   if (ioctl(uinput_fd, UI_SET_PROPBIT, INPUT_PROP_POINTER) < 0) {
++      g_debug("%s: Failed to register UI_SET_PROPBIT INPUT_PROP_POINTER\n",
++              __FUNCTION__);
++   }
+    if (ioctl(uinput_fd, UI_DEV_CREATE, 0) < 0) {
+       g_debug("%s: Failed to create UInput device\n", __FUNCTION__);
+       goto exit;
+@@ -250,6 +276,23 @@ FakeMouse_Move(int x,    // IN
+    bool retValue = true;
+    struct input_event event;
+ 
++   /*
++    * The coordinates can come straight from the host, and every uinput move
++    * comes through here. The device was declared with this range, and a
++    * compositor may do anything with a value outside it.
++    */
++   if (screenWidth > 0 && screenHeight > 0) {
++      int clampedX = MIN(MAX(x, 0), screenWidth - 1);
++      int clampedY = MIN(MAX(y, 0), screenHeight - 1);
++
++      if (clampedX != x || clampedY != y) {
++         g_debug("%s: clamping (%d, %d) to (%d, %d)\n", __FUNCTION__,
++                 x, y, clampedX, clampedY);
++         x = clampedX;
++         y = clampedY;
++      }
++   }
++
+    event.type = EV_ABS;
+    event.code = ABS_X;
+    event.value = x;
+-- 
+2.55.0
+
