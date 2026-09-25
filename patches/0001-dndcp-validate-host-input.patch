@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:09 -0700
-Subject: [PATCH 01/21] dndcp: Validate file lists and file names from the host
+Subject: [PATCH 01/22] dndcp: Validate file lists and file names from the host
  and drag sources
 
 These helpers take their input from the host RPC channel without

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:09 -0700
-Subject: [PATCH 04/21] dndcp: Read guest drags as text/uri-list, not through
+Subject: [PATCH 04/22] dndcp: Read guest drags as text/uri-list, not through
  the portal
 
 GTK's drop target preload reads the dragged value itself, and for a file

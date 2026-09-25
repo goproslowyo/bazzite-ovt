@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:10 -0700
-Subject: [PATCH 10/21] dndcp: Copy and paste through the Xwayland selection on
+Subject: [PATCH 10/22] dndcp: Copy and paste through the Xwayland selection on
  GNOME
 
 On GNOME wl-copy and wl-paste each map a window to be given focus, and

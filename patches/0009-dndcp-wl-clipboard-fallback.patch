@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:10 -0700
-Subject: [PATCH 09/21] dndcp: Fall back to wl-clipboard without
+Subject: [PATCH 09/22] dndcp: Fall back to wl-clipboard without
  ext-data-control-v1
 
 GNOME does not implement ext-data-control-v1. Where the compositor lacks

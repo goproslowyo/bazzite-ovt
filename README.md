@@ -26,7 +26,7 @@ G is the guest and H is the host.
 | GNOME 50.3 (Mutter) | text and files tested | text, files and images tested | works, XDND | files and text tested |
 | Xfce 4.20 on Xorg | works, text and files | works, text and files | works | works |
 | COSMIC 1.8 | works, text and files | works, text and files | works, native | works, XDND |
-| niri 26.04 | works, text tested | works, text tested | works, native | no, see below |
+| niri 26.04 | works, text tested | works, text tested | works, native | native, tested without the host |
 
 How each row was tested:
 
@@ -82,15 +82,18 @@ What each compositor gets depends on the protocols it offers.
 
 | Compositor offers | Copy and paste | Drag H to G | Drag G to H |
 |---|---|---|---|
-| `ext-data-control-v1` (KWin and wlroots releases that have it) | full, native | native if it also has `zwlr_layer_shell_v1` | XDND, bridged |
+| `ext-data-control-v1` (KWin and wlroots releases that have it) | full, native | native if it also has `zwlr_layer_shell_v1` | native with layer shell, else XDND, bridged |
 | no data control, X selection mirrored (Mutter) | full, through Xwayland | XDND, bridged by Mutter | XDND, bridged |
 | neither, `wl-clipboard` installed | one format per copy | XDND to X11 apps only | X11 sources only |
 
 Tested: Plasma 6.7.5, sway 1.11, GNOME 50.3, COSMIC 1.8 and Xfce 4.20 on Xorg,
-all against VMware Workstation Pro 26H1u1 on a Windows 10 host. niri 26.04
-gets copy and paste and host to guest drags, but not guest to host drags,
-because xwayland-satellite does not carry a drag from a Wayland application to
-an X window. Hyprland 0.56.2 from the `sdegler/hyprland` COPR could not be
+all against VMware Workstation Pro 26H1u1 on a Windows 10 host. Their guest to
+host drags went through XDND. Where the compositor has layer shell, guest to
+host drags now use a native drop target first (patch 0021). It was tested with
+the host on Plasma 6.7.5 and sway 1.11, and without the host on niri 26.04,
+where xwayland-satellite cannot carry a drag into X at all. It falls back to
+XDND where nothing reaches it.
+Hyprland 0.56.2 from the `sdegler/hyprland` COPR could not be
 tested, because its Xwayland exits on the first window any X11 client maps,
 `xterm` included, and vmusr cannot start without it. Not tested: other VMware
 hosts such as Fusion, and compositor releases older than their
@@ -139,7 +142,7 @@ default on Fedora. The Bluefin 44 test guest shipped the mount disabled, and
 `systemctl enable --now 'run-vmblock\x2dfuse.mount'` turns it on. Without
 vmblock the guest declines a file paste and logs why.
 
-Patch 0021 removes a staging directory about two minutes after its transfer
+Patch 0022 removes a staging directory about two minutes after its transfer
 is over. It keeps a directory while the clipboard still offers its files,
 while a drag still uses it, and while any process has a file in it open or
 uses it as its working directory. The check runs once a minute. It does not
@@ -149,11 +152,19 @@ read a dropped file again later.
 
 ### Drag and drop
 
-Guest to host drag, of files or text, always uses the upstream XDND code with
-an Xwayland detection window. KWin and Mutter bridge its XDND to native
-Wayland applications. KWin bridges only to managed windows, so under Wayland
-patch 0013 keeps the window managed and waits until the window manager lists
-it before moving the pointer.
+Guest to host drag, of files or text, takes one of two paths.
+
+- Where the compositor has `zwlr_layer_shell_v1`, patch 0021 shows the
+  layer-shell overlays as a Wayland drop target. The drag enters them as it
+  would any Wayland window, and the overlay reads the file list or text for
+  the host. It accepts copy only, since the host reads the files after the
+  drop. A drag the host cannot take goes on to the window under the overlay.
+  If nothing reaches the overlay, the plugin uses the detection window below.
+- Elsewhere the upstream XDND code runs with an Xwayland detection window.
+  KWin and Mutter bridge its XDND to native Wayland applications. KWin
+  bridges only to managed windows, so under Wayland patch 0013 keeps the
+  window managed and waits until the window manager lists it before moving
+  the pointer.
 
 Host to guest drag takes one of two paths.
 
@@ -194,8 +205,6 @@ sway needs the native path.
 - If the VMware window scales the guest display rather than resizing it,
   host to guest drags land beside where the host pointer is. Use a guest
   resolution that fits the window, such as View, Autosize, Autofit Guest.
-- On niri, a scrolling tiler, the view scrolls to the detection window each
-  time the pointer leaves the guest.
 - A file name the host cannot use is changed there. Windows does not allow
   `:`, so the host writes it as `^%`.
 - An application that reads a dropped file more than two minutes after the
@@ -210,7 +219,7 @@ sway needs the native path.
 
 ## Patches
 
-Twenty-one patches against `open-vm-tools 13.1.0-25218885`, applied in order
+Twenty-two patches against `open-vm-tools 13.1.0-25218885`, applied in order
 and grouped by topic. Each builds on its own, and each explains its reasoning
 in its commit message. The first four change only upstream code and apply to
 X11 sessions as well.
@@ -237,7 +246,8 @@ X11 sessions as well.
 | `0018-dndcp-native-drag-accept` | Releases only once the target accepts. |
 | `0019-dndcp-gnome-drag-host-to-guest` | Host to guest drags into Wayland applications on GNOME. |
 | `0020-dndcp-gnome-drag-guest-to-host` | Guest to host drags on GNOME and tiling compositors. |
-| `0021-dndcp-staging-cleanup` | Removes staging directories once their transfers are over. |
+| `0021-dndcp-native-drop-target` | Receives guest to host drags through a native drop target where layer shell exists. |
+| `0022-dndcp-staging-cleanup` | Removes staging directories once their transfers are over. |
 
 ### Using the patches elsewhere
 
@@ -361,6 +371,11 @@ grep -a 'drag source' $log                  # native drag source ready, or why n
   `GTK did not start the drag` means the press missed the detection window.
   `the pointer never reached the detection` window usually means the host
   still holds the button from a guest to host drag.
+- A native guest to host drag logs `native drop target shown on`,
+  `a drag entered the drop target, reading text/uri-list` and
+  `drag entering, telling the host`. On the drop it logs
+  `finished the drop of`. `nothing reached the native drop target` means it
+  fell back to the detection window.
 - `the guest drag outlived the drop; cancelling it` means patch 0020 pressed
   Escape after a guest to host drop on GNOME.
 - `PruneStagingDirectories` logs `removed` and the path of each staging

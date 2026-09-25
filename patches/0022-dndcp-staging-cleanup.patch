@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:11 -0700
-Subject: [PATCH 21/21] dndcp: Remove staging directories once their transfers
+Subject: [PATCH 22/22] dndcp: Remove staging directories once their transfers
  are over
 
 A host to guest file transfer is staged under
@@ -940,10 +940,10 @@ index da54ee5..7cc95b5 100644
        if (mkdtemp(realStagingDir) != NULL) {
           char *randomPart = strrchr(realStagingDir, '/') + 1;
 diff --git a/services/plugins/dndcp/dndUIX11GTK4.cpp b/services/plugins/dndcp/dndUIX11GTK4.cpp
-index a61ba66..4f8af71 100644
+index 8307284..89423bf 100644
 --- a/services/plugins/dndcp/dndUIX11GTK4.cpp
 +++ b/services/plugins/dndcp/dndUIX11GTK4.cpp
-@@ -1385,6 +1385,10 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
+@@ -1412,6 +1412,10 @@ DnDUIX11::OnSrcDragBegin(const CPClipboard *clip,       // IN
  
     if (CPClipboard_GetItem(&mClipboard, CPFORMAT_FILELIST, &buf, &sz)) {
        mHGStagingDir = utf::string(stagingDir.c_str());
@@ -954,7 +954,7 @@ index a61ba66..4f8af71 100644
  
        /* Provide path within vmblock file system instead of actual path. */
        stagingDirName = GetLastDirName(mHGStagingDir);
-@@ -2268,6 +2272,10 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
+@@ -2669,6 +2673,10 @@ DnDUIX11::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
      */
  
     mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:09 -0700
-Subject: [PATCH 02/21] dndcp: Offer file lists on desktops other than GNOME
+Subject: [PATCH 02/22] dndcp: Offer file lists on desktops other than GNOME
  and KDE
 
 LocalSetContentProvider() and the two uri-list builders in the GTK4 drag

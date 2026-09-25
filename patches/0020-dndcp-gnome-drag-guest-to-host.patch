@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:11 -0700
-Subject: [PATCH 20/21] dndcp: Make guest to host drags reach the drop target
+Subject: [PATCH 20/22] dndcp: Make guest to host drags reach the drop target
  on GNOME and sway
 
 A guest to host drag failed on GNOME too. The detection window was

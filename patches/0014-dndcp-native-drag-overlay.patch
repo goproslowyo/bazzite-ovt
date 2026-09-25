@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:10 -0700
-Subject: [PATCH 14/21] dndcp: Map a layer shell overlay for a native Wayland
+Subject: [PATCH 14/22] dndcp: Map a layer shell overlay for a native Wayland
  drag
 
 A host to guest drag is an XDND drag from the detection window, a Gtk

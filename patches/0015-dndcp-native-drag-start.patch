@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:11 -0700
-Subject: [PATCH 15/21] dndcp: Start a native Wayland drag from the faked press
+Subject: [PATCH 15/22] dndcp: Start a native Wayland drag from the faked press
 
 Turn the press on the overlay into a wl_data_device drag.
 PointerButton() starts the drag from inside the handler of the press,

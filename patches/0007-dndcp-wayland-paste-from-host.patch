@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: GoProSlowYo <68455785+goproslowyo@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:25:09 -0700
-Subject: [PATCH 07/21] dndcp: Copy and paste from the host in a Wayland
+Subject: [PATCH 07/22] dndcp: Copy and paste from the host in a Wayland
  session
 
 Copy and paste between host and guest does not work in a Wayland

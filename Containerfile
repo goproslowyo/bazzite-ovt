@@ -166,6 +166,7 @@ RUN set -eux; \
     strings "$so" | grep -q 'never agreed'; \
     strings "$so" | grep -q 'Mutter bridges XDND'; \
     strings "$so" | grep -q 'outlived the drop'; \
+    strings "$so" | grep -q 'native drop target shown on'; \
     strings "$so" | grep -q 'PruneStagingDirectories'; \
     echo "patched dndcp verified"
 
